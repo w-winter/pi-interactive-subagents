@@ -1,0 +1,13 @@
+{
+  "packages": [
+    {
+      "source": "git:github.com/HazAT/pi-interactive-subagents",
+      "extensions": [],
+      "skills": []
+    }
+  ],
+  "extensions": [
+    "../pi-extension/subagents/index.ts",
+    "../pi-extension/session-artifacts/index.ts"
+  ]
+}

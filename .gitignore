@@ -1,3 +1,4 @@
 node_modules/
 .pi/*
 !.pi/skills/
+!.pi/settings.json
