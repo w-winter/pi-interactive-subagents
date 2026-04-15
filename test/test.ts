@@ -17,7 +17,7 @@ import {
 } from "../pi-extension/subagents/session.ts";
 
 import { shellEscape, isCmuxAvailable, isWezTermAvailable } from "../pi-extension/subagents/cmux.ts";
-import {
+import subagentDoneExtension, {
   shouldMarkUserTookOver,
   shouldAutoExitOnAgentEnd,
 } from "../pi-extension/subagents/subagent-done.ts";
@@ -33,6 +33,34 @@ function createSessionFile(dir: string, entries: object[]): string {
   const content = entries.map((e) => JSON.stringify(e)).join("\n") + "\n";
   writeFileSync(file, content);
   return file;
+}
+
+function createMockExtensionApi() {
+  const registeredTools: Array<{ name: string }> = [];
+  return {
+    registeredTools,
+    api: {
+      on() {},
+      registerTool(tool: { name: string }) {
+        registeredTools.push(tool);
+      },
+      registerCommand() {},
+      registerMessageRenderer() {},
+      registerShortcut() {},
+      getAllTools() {
+        return [];
+      },
+    } as any,
+  };
+}
+
+function restoreEnvVar(name: string, value: string | undefined) {
+  if (value === undefined) {
+    delete process.env[name];
+    return;
+  }
+
+  process.env[name] = value;
 }
 
 const SESSION_HEADER = { type: "session", id: "sess-001", version: 3 };
@@ -280,6 +308,42 @@ describe("subagent-done.ts", () => {
     });
   });
 });
+describe("tool registration", () => {
+  it("does not register set_tab_title in the main session extension", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+
+    (subagentsModule as any).default(api);
+
+    assert.equal(registeredTools.some((tool) => tool.name === "set_tab_title"), false);
+  });
+
+  it("registers set_tab_title in subagent sessions", () => {
+    const previousDeniedTools = process.env.PI_DENY_TOOLS;
+
+    try {
+      delete process.env.PI_DENY_TOOLS;
+      const { api, registeredTools } = createMockExtensionApi();
+      subagentDoneExtension(api);
+      assert.equal(registeredTools.some((tool) => tool.name === "set_tab_title"), true);
+    } finally {
+      restoreEnvVar("PI_DENY_TOOLS", previousDeniedTools);
+    }
+  });
+
+  it("skips set_tab_title in subagent sessions when denied", () => {
+    const previousDeniedTools = process.env.PI_DENY_TOOLS;
+
+    try {
+      process.env.PI_DENY_TOOLS = "set_tab_title,subagent";
+      const { api, registeredTools } = createMockExtensionApi();
+      subagentDoneExtension(api);
+      assert.equal(registeredTools.some((tool) => tool.name === "set_tab_title"), false);
+    } finally {
+      restoreEnvVar("PI_DENY_TOOLS", previousDeniedTools);
+    }
+  });
+});
+
 describe("subagents widget rendering", () => {
   it("keeps every rendered line within a very narrow width", () => {
     const testApi = (subagentsModule as any).__test__;

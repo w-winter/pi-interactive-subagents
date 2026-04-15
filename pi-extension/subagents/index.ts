@@ -179,16 +179,7 @@ function formatElapsed(seconds: number): string {
   return `${m}m ${s}s`;
 }
 
-function muxUnavailableResult(kind: "subagents" | "tab-title" = "subagents") {
-  if (kind === "tab-title") {
-    return {
-      content: [
-        { type: "text" as const, text: `Terminal multiplexer not available. ${muxSetupHint()}` },
-      ],
-      details: { error: "mux not available" },
-    };
-  }
-
+function muxUnavailableResult() {
   return {
     content: [
       {
@@ -796,7 +787,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Validate prerequisites
         if (!isMuxAvailable()) {
-          return muxUnavailableResult("subagents");
+          return muxUnavailableResult();
         }
 
         if (!ctx.sessionManager.getSessionFile()) {
@@ -1044,42 +1035,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
-  // ── set_tab_title tool ──
-  if (shouldRegister("set_tab_title"))
-    pi.registerTool({
-      name: "set_tab_title",
-      label: "Set Tab Title",
-      description:
-        "Update the current tab/window and workspace/session title. Use to show progress during multi-phase workflows " +
-        "(e.g. planning, executing todos, reviewing). Keep titles short and informative.",
-      promptSnippet:
-        "Update the current tab/window and workspace/session title. Use to show progress during multi-phase workflows " +
-        "(e.g. planning, executing todos, reviewing). Keep titles short and informative.",
-      parameters: Type.Object({
-        title: Type.String({
-          description: "New tab title (also applied to workspace/session when supported)",
-        }),
-      }),
-
-      async execute(_toolCallId, params) {
-        if (!isMuxAvailable()) {
-          return muxUnavailableResult("tab-title");
-        }
-        try {
-          renameCurrentTab(params.title);
-          renameWorkspace(params.title);
-          return {
-            content: [{ type: "text", text: `Title set to: ${params.title}` }],
-            details: { title: params.title },
-          };
-        } catch (err: any) {
-          return {
-            content: [{ type: "text", text: `Failed to set title: ${err?.message}` }],
-            details: { error: err?.message },
-          };
-        }
-      },
-    });
 
   // ── subagent_resume tool ──
   if (shouldRegister("subagent_resume"))
@@ -1140,7 +1095,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const startTime = Date.now();
 
         if (!isMuxAvailable()) {
-          return muxUnavailableResult("subagents");
+          return muxUnavailableResult();
         }
 
         if (!existsSync(params.sessionPath)) {

@@ -54,14 +54,15 @@ Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm` to force a specific bac
 
 ### Extensions
 
-**Subagents** — 4 tools + 3 commands:
+**Subagents** — 3 main-session tools + 3 commands, plus 1 subagent-only tool:
 
 | Tool              | Description                                                                     |
 | ----------------- | ------------------------------------------------------------------------------- |
 | `subagent`        | Spawn a sub-agent in a dedicated multiplexer pane (async — returns immediately) |
 | `subagents_list`  | List available agent definitions                                                |
-| `set_tab_title`   | Update tab/window title to show progress                                        |
 | `subagent_resume` | Resume a previous sub-agent session (async)                                     |
+
+`set_tab_title` is available only inside subagent sessions, where it updates the child tab/window title to show progress.
 
 | Command                    | Description                          |
 | -------------------------- | ------------------------------------ |
