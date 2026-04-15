@@ -70,6 +70,19 @@ interface AgentDefaults {
   systemPromptMode?: "append" | "replace";
   cwd?: string;
   body?: string;
+  disableModelInvocation?: boolean;
+}
+
+type AgentSource = "package" | "global" | "project";
+
+interface AgentDefinition extends AgentDefaults {
+  name: string;
+  description?: string;
+  disableModelInvocation: boolean;
+}
+
+interface ListedAgentDefinition extends AgentDefinition {
+  source: AgentSource;
 }
 
 /** Tools that are gated by `spawning: false` */
@@ -107,6 +120,70 @@ function getAgentConfigDir(): string {
   return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 }
 
+function getBundledAgentsDir(): string {
+  return join(dirname(new URL(import.meta.url).pathname), "../../agents");
+}
+
+function getFrontmatterValue(frontmatter: string, key: string): string | undefined {
+  const match = frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
+  return match ? match[1].trim() : undefined;
+}
+
+function parseOptionalBoolean(value: string | undefined): boolean | undefined {
+  return value != null ? value === "true" : undefined;
+}
+
+function parseAgentDefinition(content: string, fallbackName: string): AgentDefinition | null {
+  const match = content.match(/^---\n([\s\S]*?)\n---/);
+  if (!match) return null;
+
+  const frontmatter = match[1];
+  const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
+  const systemPromptMode = getFrontmatterValue(frontmatter, "system-prompt");
+
+  return {
+    name: getFrontmatterValue(frontmatter, "name") ?? fallbackName,
+    description: getFrontmatterValue(frontmatter, "description"),
+    model: getFrontmatterValue(frontmatter, "model"),
+    tools: getFrontmatterValue(frontmatter, "tools"),
+    systemPromptMode:
+      systemPromptMode === "replace"
+        ? "replace"
+        : systemPromptMode === "append"
+          ? "append"
+          : undefined,
+    skills: getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills"),
+    thinking: getFrontmatterValue(frontmatter, "thinking"),
+    denyTools: getFrontmatterValue(frontmatter, "deny-tools"),
+    spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
+    autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
+    cwd: getFrontmatterValue(frontmatter, "cwd"),
+    body: body || undefined,
+    disableModelInvocation:
+      getFrontmatterValue(frontmatter, "disable-model-invocation")?.toLowerCase() === "true",
+  };
+}
+
+function discoverAgentDefinitions(): ListedAgentDefinition[] {
+  const agents = new Map<string, ListedAgentDefinition>();
+  const dirs: Array<{ path: string; source: AgentSource }> = [
+    { path: getBundledAgentsDir(), source: "package" },
+    { path: join(getAgentConfigDir(), "agents"), source: "global" },
+    { path: join(process.cwd(), ".pi", "agents"), source: "project" },
+  ];
+
+  for (const { path: dir, source } of dirs) {
+    if (!existsSync(dir)) continue;
+    for (const file of readdirSync(dir).filter((entry) => entry.endsWith(".md"))) {
+      const parsed = parseAgentDefinition(readFileSync(join(dir, file), "utf8"), file.replace(/\.md$/, ""));
+      if (!parsed) continue;
+      agents.set(parsed.name, { ...parsed, source });
+    }
+  }
+
+  return [...agents.values()];
+}
+
 function resolveSubagentPaths(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
@@ -139,36 +216,15 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
   const paths = [
     join(process.cwd(), ".pi", "agents", `${agentName}.md`),
     join(configDir, "agents", `${agentName}.md`),
-    join(dirname(new URL(import.meta.url).pathname), "../../agents", `${agentName}.md`),
+    join(getBundledAgentsDir(), `${agentName}.md`),
   ];
+
   for (const p of paths) {
     if (!existsSync(p)) continue;
-    const content = readFileSync(p, "utf8");
-    const match = content.match(/^---\n([\s\S]*?)\n---/);
-    if (!match) continue;
-    const frontmatter = match[1];
-    const get = (key: string) => {
-      const m = frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
-      return m ? m[1].trim() : undefined;
-    };
-    // Extract body (everything after frontmatter)
-    const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
-    const spawningRaw = get("spawning");
-    const autoExitRaw = get("auto-exit");
-    const spm = get("system-prompt");
-    return {
-      model: get("model"),
-      tools: get("tools"),
-      systemPromptMode: spm === "replace" ? "replace" : spm === "append" ? "append" : undefined,
-      skills: get("skill") ?? get("skills"),
-      thinking: get("thinking"),
-      denyTools: get("deny-tools"),
-      spawning: spawningRaw != null ? spawningRaw === "true" : undefined,
-      autoExit: autoExitRaw != null ? autoExitRaw === "true" : undefined,
-      cwd: get("cwd"),
-      body: body || undefined,
-    };
+    const parsed = parseAgentDefinition(readFileSync(p, "utf8"), agentName);
+    if (parsed) return parsed;
   }
+
   return null;
 }
 
@@ -379,6 +435,8 @@ function updateWidget() {
 export const __test__ = {
   borderLine,
   renderSubagentWidgetLines,
+  loadAgentDefaults,
+  discoverAgentDefinitions,
 };
 
 function startWidgetRefresh() {
@@ -963,49 +1021,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       parameters: Type.Object({}),
 
       async execute() {
-        const agents = new Map<
-          string,
-          { name: string; description?: string; model?: string; source: string }
-        >();
+        const list = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
 
-        const dirs = [
-          {
-            path: join(dirname(new URL(import.meta.url).pathname), "../../agents"),
-            source: "package",
-          },
-          { path: join(getAgentConfigDir(), "agents"), source: "global" },
-          { path: join(process.cwd(), ".pi", "agents"), source: "project" },
-        ];
-
-        for (const { path: dir, source } of dirs) {
-          if (!existsSync(dir)) continue;
-          for (const file of readdirSync(dir).filter((f) => f.endsWith(".md"))) {
-            const content = readFileSync(join(dir, file), "utf8");
-            const match = content.match(/^---\n([\s\S]*?)\n---/);
-            if (!match) continue;
-            const frontmatter = match[1];
-            const get = (key: string) => {
-              const m = frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
-              return m ? m[1].trim() : undefined;
-            };
-            const name = get("name") ?? file.replace(/\.md$/, "");
-            agents.set(name, {
-              name,
-              description: get("description"),
-              model: get("model"),
-              source,
-            });
-          }
-        }
-
-        if (agents.size === 0) {
+        if (list.length === 0) {
           return {
             content: [{ type: "text", text: "No subagent definitions found." }],
             details: { agents: [] },
           };
         }
 
-        const list = [...agents.values()];
         const lines = list.map((a) => {
           const badge = a.source === "project" ? " (project)" : "";
           const desc = a.description ? ` — ${a.description}` : "";

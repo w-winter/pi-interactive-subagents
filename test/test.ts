@@ -36,12 +36,12 @@ function createSessionFile(dir: string, entries: object[]): string {
 }
 
 function createMockExtensionApi() {
-  const registeredTools: Array<{ name: string }> = [];
+  const registeredTools: Array<any> = [];
   return {
     registeredTools,
     api: {
       on() {},
-      registerTool(tool: { name: string }) {
+      registerTool(tool: any) {
         registeredTools.push(tool);
       },
       registerCommand() {},
@@ -61,6 +61,36 @@ function restoreEnvVar(name: string, value: string | undefined) {
   }
 
   process.env[name] = value;
+}
+
+function writeAgentFile(agentsDir: string, name: string, frontmatter: string, body = "You are a test agent.") {
+  mkdirSync(agentsDir, { recursive: true });
+  writeFileSync(join(agentsDir, `${name}.md`), `---\n${frontmatter}\n---\n\n${body}\n`);
+}
+
+async function withIsolatedAgentEnv(
+  fn: (paths: { projectDir: string; projectAgentsDir: string; globalDir: string; globalAgentsDir: string }) => Promise<void> | void,
+) {
+  const root = createTestDir();
+  const previousCwd = process.cwd();
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const projectDir = join(root, "project");
+  const projectAgentsDir = join(projectDir, ".pi", "agents");
+  const globalDir = join(root, "global");
+  const globalAgentsDir = join(globalDir, "agents");
+
+  mkdirSync(projectAgentsDir, { recursive: true });
+  mkdirSync(globalAgentsDir, { recursive: true });
+  process.chdir(projectDir);
+  process.env.PI_CODING_AGENT_DIR = globalDir;
+
+  try {
+    await fn({ projectDir, projectAgentsDir, globalDir, globalAgentsDir });
+  } finally {
+    process.chdir(previousCwd);
+    restoreEnvVar("PI_CODING_AGENT_DIR", previousAgentDir);
+    rmSync(root, { recursive: true, force: true });
+  }
 }
 
 const SESSION_HEADER = { type: "session", id: "sess-001", version: 3 };
@@ -276,6 +306,114 @@ describe("session.ts", () => {
       // Target should now have 3 entries
       const targetLines = readFileSync(targetFile, "utf8").trim().split("\n");
       assert.equal(targetLines.length, 3);
+    });
+  });
+});
+
+describe("subagent discovery", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("lists visible agents from discovery", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "visible-discovery-test-agent",
+        [
+          "name: visible-discovery-test-agent",
+          "description: Visible test agent",
+          "model: anthropic/test-visible",
+        ].join("\n"),
+      );
+
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+
+      const tool = registeredTools.find((registeredTool) => registeredTool.name === "subagents_list");
+      assert.ok(tool, "expected subagents_list to be registered");
+
+      const result = await tool.execute();
+      const agents = result.details?.agents ?? [];
+
+      assert.ok(agents.some((agent: any) => agent.name === "visible-discovery-test-agent"));
+      assert.match(result.content[0].text, /visible-discovery-test-agent/);
+    });
+  });
+
+  it("hides disable-model-invocation agents from listings but keeps direct loading", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "hidden-discovery-test-agent",
+        [
+          "name: hidden-discovery-test-agent",
+          "description: Hidden test agent",
+          "model: anthropic/test-hidden",
+          "disable-model-invocation: true",
+        ].join("\n"),
+        "You are the hidden agent.",
+      );
+
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+
+      const tool = registeredTools.find((registeredTool) => registeredTool.name === "subagents_list");
+      assert.ok(tool, "expected subagents_list to be registered");
+
+      const result = await tool.execute();
+      const agents = result.details?.agents ?? [];
+
+      assert.equal(agents.some((agent: any) => agent.name === "hidden-discovery-test-agent"), false);
+      assert.doesNotMatch(result.content[0].text, /hidden-discovery-test-agent/);
+
+      const loaded = testApi.loadAgentDefaults("hidden-discovery-test-agent");
+      assert.ok(loaded, "expected hidden agent to remain directly loadable");
+      assert.equal(loaded.model, "anthropic/test-hidden");
+      assert.equal(loaded.body, "You are the hidden agent.");
+      assert.equal(loaded.disableModelInvocation, true);
+    });
+  });
+
+  it("lets a hidden project agent shadow a visible global agent", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir, globalAgentsDir }) => {
+      writeAgentFile(
+        globalAgentsDir,
+        "shadowed-discovery-test-agent",
+        [
+          "name: shadowed-discovery-test-agent",
+          "description: Global visible agent",
+          "model: anthropic/test-global",
+        ].join("\n"),
+        "You are the global visible agent.",
+      );
+      writeAgentFile(
+        projectAgentsDir,
+        "shadowed-discovery-test-agent",
+        [
+          "name: shadowed-discovery-test-agent",
+          "description: Project hidden agent",
+          "model: anthropic/test-project",
+          "disable-model-invocation: true",
+        ].join("\n"),
+        "You are the project hidden agent.",
+      );
+
+      const { api, registeredTools } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+
+      const tool = registeredTools.find((registeredTool) => registeredTool.name === "subagents_list");
+      assert.ok(tool, "expected subagents_list to be registered");
+
+      const result = await tool.execute();
+      const agents = result.details?.agents ?? [];
+
+      assert.equal(agents.some((agent: any) => agent.name === "shadowed-discovery-test-agent"), false);
+      assert.doesNotMatch(result.content[0].text, /shadowed-discovery-test-agent/);
+
+      const loaded = testApi.loadAgentDefaults("shadowed-discovery-test-agent");
+      assert.ok(loaded, "expected project override to remain directly loadable");
+      assert.equal(loaded.model, "anthropic/test-project");
+      assert.equal(loaded.body, "You are the project hidden agent.");
+      assert.equal(loaded.disableModelInvocation, true);
     });
   });
 });

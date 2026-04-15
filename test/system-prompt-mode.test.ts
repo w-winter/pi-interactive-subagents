@@ -33,6 +33,7 @@ function parseFrontmatter(content: string) {
   const spm = get("system-prompt");
   return {
     systemPromptMode: spm === "replace" ? "replace" : spm === "append" ? "append" : undefined,
+    disableModelInvocation: get("disable-model-invocation")?.toLowerCase() === "true",
     body: body || undefined,
   };
 }
@@ -84,6 +85,13 @@ system-prompt: foobar
 
 Body here.`;
 
+const AGENT_HIDDEN = `---
+model: anthropic/claude-sonnet-4-20250514
+disable-model-invocation: true
+---
+
+Hidden body.`;
+
 // --- Test 1: Frontmatter parsing ---
 console.log("\n🧪 Frontmatter parsing of system-prompt field");
 
@@ -99,6 +107,9 @@ assert(r3.systemPromptMode === undefined, "no system-prompt field → mode is un
 
 const r4 = parseFrontmatter(AGENT_INVALID)!;
 assert(r4.systemPromptMode === undefined, "system-prompt: foobar → mode is undefined (ignored)");
+
+const r5 = parseFrontmatter(AGENT_HIDDEN)!;
+assert(r5.disableModelInvocation === true, "disable-model-invocation: true → hidden from discovery");
 
 // --- Test 2: Identity routing ---
 console.log("\n🧪 Identity routing (system prompt vs user message)");
@@ -137,6 +148,7 @@ mkdirSync(agentsDir, { recursive: true });
 writeFileSync(join(agentsDir, "test-replace.md"), AGENT_REPLACE);
 writeFileSync(join(agentsDir, "test-append.md"), AGENT_APPEND);
 writeFileSync(join(agentsDir, "test-default.md"), AGENT_DEFAULT);
+writeFileSync(join(agentsDir, "test-hidden.md"), AGENT_HIDDEN);
 
 function loadFromDir(name: string) {
   const p = join(agentsDir, `${name}.md`);
@@ -153,6 +165,9 @@ assert(t2.systemPromptMode === "append", "file test-append.md → append mode");
 
 const t3 = loadFromDir("test-default")!;
 assert(t3.systemPromptMode === undefined, "file test-default.md → no mode");
+
+const t4 = loadFromDir("test-hidden")!;
+assert(t4.disableModelInvocation === true, "file test-hidden.md → hidden from discovery");
 
 rmSync(tmpDir, { recursive: true });
 

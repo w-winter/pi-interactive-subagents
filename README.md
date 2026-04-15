@@ -250,8 +250,11 @@ You are a specialized agent that does X...
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
 | `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
+| `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`.                                                                                                                         |
 
 ---
+
+Discovery still resolves precedence before visibility filtering. If a project-local hidden agent has the same name as a visible global or bundled agent, the hidden project agent wins and the lower-precedence agent does not appear in `subagents_list`.
 
 ### `auto-exit`
 
