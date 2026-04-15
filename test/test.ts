@@ -14,6 +14,7 @@ import {
   appendBranchSummary,
   copySessionFile,
   mergeNewEntries,
+  seedSubagentSessionFile,
 } from "../pi-extension/subagents/session.ts";
 
 import { shellEscape, isCmuxAvailable, isWezTermAvailable } from "../pi-extension/subagents/cmux.ts";
@@ -37,16 +38,25 @@ function createSessionFile(dir: string, entries: object[]): string {
 
 function createMockExtensionApi() {
   const registeredTools: Array<any> = [];
+  const registeredCommands: Array<any> = [];
+  const sentUserMessages: string[] = [];
   return {
     registeredTools,
+    registeredCommands,
+    sentUserMessages,
     api: {
       on() {},
       registerTool(tool: any) {
         registeredTools.push(tool);
       },
-      registerCommand() {},
+      registerCommand(name: string, command: any) {
+        registeredCommands.push({ name, ...command });
+      },
       registerMessageRenderer() {},
       registerShortcut() {},
+      sendUserMessage(message: string) {
+        sentUserMessages.push(message);
+      },
       getAllTools() {
         return [];
       },
@@ -284,6 +294,52 @@ describe("session.ts", () => {
     });
   });
 
+  describe("seedSubagentSessionFile", () => {
+    it("creates a lineage-only child session with parent linkage and no copied turns", () => {
+      const parentFile = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
+      const childFile = join(dir, "lineage-child.jsonl");
+
+      seedSubagentSessionFile({
+        mode: "lineage-only",
+        parentSessionFile: parentFile,
+        childSessionFile: childFile,
+        childCwd: "/tmp/child-cwd",
+      });
+
+      const lines = readFileSync(childFile, "utf8").trim().split("\n");
+      assert.equal(lines.length, 1);
+
+      const header = JSON.parse(lines[0]);
+      assert.equal(header.type, "session");
+      assert.equal(header.parentSession, parentFile);
+      assert.equal(header.cwd, "/tmp/child-cwd");
+    });
+
+    it("creates a forked child session with copied context before the triggering user turn", () => {
+      const parentFile = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
+      const childFile = join(dir, "fork-child.jsonl");
+
+      seedSubagentSessionFile({
+        mode: "fork",
+        parentSessionFile: parentFile,
+        childSessionFile: childFile,
+        childCwd: "/tmp/fork-child-cwd",
+      });
+
+      const entries = readFileSync(childFile, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      assert.equal(entries.length, 2);
+      assert.equal(entries[0].type, "session");
+      assert.equal(entries[0].parentSession, parentFile);
+      assert.equal(entries[0].cwd, "/tmp/fork-child-cwd");
+      assert.equal(entries[1].type, "model_change");
+      assert.equal(entries.some((entry) => entry.type === "session" && entry.parentSession !== parentFile), false);
+      assert.equal(entries.some((entry) => entry.type === "message"), false);
+    });
+  });
+
   describe("mergeNewEntries", () => {
     it("appends new entries from source to target", () => {
       // Source starts with same base (2 entries), then has 1 new entry
@@ -312,6 +368,90 @@ describe("session.ts", () => {
 
 describe("subagent discovery", () => {
   const testApi = (subagentsModule as any).__test__;
+
+  it("loads session-mode from frontmatter", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "lineage-mode-test-agent",
+        [
+          "name: lineage-mode-test-agent",
+          "model: anthropic/test-lineage",
+          "session-mode: lineage-only",
+        ].join("\n"),
+      );
+
+      const loaded = testApi.loadAgentDefaults("lineage-mode-test-agent");
+      assert.ok(loaded, "expected agent to load");
+      assert.equal(loaded.sessionMode, "lineage-only");
+    });
+  });
+
+  it("ignores invalid session-mode values", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "invalid-mode-test-agent",
+        [
+          "name: invalid-mode-test-agent",
+          "model: anthropic/test-invalid",
+          "session-mode: sideways",
+        ].join("\n"),
+      );
+
+      const loaded = testApi.loadAgentDefaults("invalid-mode-test-agent");
+      assert.ok(loaded, "expected agent to load");
+      assert.equal(loaded.sessionMode, undefined);
+    });
+  });
+
+  it("resolves session mode with fork override precedence", () => {
+    assert.equal(testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, null), "standalone");
+    assert.equal(
+      testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, { sessionMode: "lineage-only" }),
+      "lineage-only",
+    );
+    assert.equal(
+      testApi.resolveEffectiveSessionMode({ name: "A", task: "T", fork: true }, { sessionMode: "lineage-only" }),
+      "fork",
+    );
+  });
+
+  it("resolves launch behavior for standalone, lineage-only, and fork modes", () => {
+    assert.deepEqual(testApi.resolveLaunchBehavior({ name: "A", task: "T" }, null), {
+      sessionMode: "standalone",
+      seededSessionMode: null,
+      inheritsConversationContext: false,
+      taskDelivery: "artifact",
+    });
+    assert.deepEqual(
+      testApi.resolveLaunchBehavior({ name: "A", task: "T" }, { sessionMode: "lineage-only" }),
+      {
+        sessionMode: "lineage-only",
+        seededSessionMode: "lineage-only",
+        inheritsConversationContext: false,
+        taskDelivery: "artifact",
+      },
+    );
+    assert.deepEqual(
+      testApi.resolveLaunchBehavior({ name: "A", task: "T" }, { sessionMode: "fork" }),
+      {
+        sessionMode: "fork",
+        seededSessionMode: "fork",
+        inheritsConversationContext: true,
+        taskDelivery: "direct",
+      },
+    );
+    assert.deepEqual(
+      testApi.resolveLaunchBehavior({ name: "A", task: "T", fork: true }, { sessionMode: "lineage-only" }),
+      {
+        sessionMode: "fork",
+        seededSessionMode: "fork",
+        inheritsConversationContext: true,
+        taskDelivery: "direct",
+      },
+    );
+  });
 
   it("lists visible agents from discovery", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
@@ -446,6 +586,23 @@ describe("subagent-done.ts", () => {
     });
   });
 });
+describe("commands", () => {
+  it("/iterate always emits a full-context fork tool call", () => {
+    const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
+
+    (subagentsModule as any).default(api);
+
+    const iterate = registeredCommands.find((command) => command.name === "iterate");
+    assert.ok(iterate, "expected /iterate to be registered");
+
+    iterate.handler("Fix the bug", {});
+
+    assert.equal(sentUserMessages.length, 1);
+    assert.match(sentUserMessages[0], /fork: true/);
+    assert.match(sentUserMessages[0], /name: "Iterate"/);
+  });
+});
+
 describe("tool registration", () => {
   it("does not register set_tab_title in the main session extension", () => {
     const { api, registeredTools } = createMockExtensionApi();

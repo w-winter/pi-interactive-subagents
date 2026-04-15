@@ -12,7 +12,6 @@ import {
   mkdirSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { randomUUID } from "node:crypto";
 import {
   isMuxAvailable,
   muxSetupHint,
@@ -24,7 +23,7 @@ import {
   renameCurrentTab,
   renameWorkspace,
 } from "./cmux.ts";
-import { getNewEntries, findLastAssistantMessage } from "./session.ts";
+import { findLastAssistantMessage, getNewEntries, seedSubagentSessionFile } from "./session.ts";
 
 const SubagentParams = Type.Object({
   name: Type.String({ description: "Display name for the subagent" }),
@@ -54,10 +53,12 @@ const SubagentParams = Type.Object({
   fork: Type.Optional(
     Type.Boolean({
       description:
-        "Fork the current session — sub-agent gets full conversation context. Use for iterate/bugfix patterns.",
+        "Force the full-context fork mode for this spawn. The sub-agent inherits the current session conversation, overriding any agent frontmatter session-mode.",
     }),
   ),
 });
+
+type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
 interface AgentDefaults {
   model?: string;
@@ -68,6 +69,7 @@ interface AgentDefaults {
   spawning?: boolean;
   autoExit?: boolean;
   systemPromptMode?: "append" | "replace";
+  sessionMode?: SubagentSessionMode;
   cwd?: string;
   body?: string;
   disableModelInvocation?: boolean;
@@ -133,6 +135,14 @@ function parseOptionalBoolean(value: string | undefined): boolean | undefined {
   return value != null ? value === "true" : undefined;
 }
 
+function parseSessionMode(value: string | undefined): SubagentSessionMode | undefined {
+  if (value === "standalone" || value === "lineage-only" || value === "fork") {
+    return value;
+  }
+
+  return undefined;
+}
+
 function parseAgentDefinition(content: string, fallbackName: string): AgentDefinition | null {
   const match = content.match(/^---\n([\s\S]*?)\n---/);
   if (!match) return null;
@@ -157,6 +167,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     denyTools: getFrontmatterValue(frontmatter, "deny-tools"),
     spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
+    sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
     cwd: getFrontmatterValue(frontmatter, "cwd"),
     body: body || undefined,
     disableModelInvocation:
@@ -226,6 +237,33 @@ function loadAgentDefaults(agentName: string): AgentDefaults | null {
   }
 
   return null;
+}
+
+function resolveEffectiveSessionMode(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+): SubagentSessionMode {
+  if (params.fork) return "fork";
+  return agentDefs?.sessionMode ?? "standalone";
+}
+
+function resolveLaunchBehavior(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+): {
+  sessionMode: SubagentSessionMode;
+  seededSessionMode: "lineage-only" | "fork" | null;
+  inheritsConversationContext: boolean;
+  taskDelivery: "direct" | "artifact";
+} {
+  const sessionMode = resolveEffectiveSessionMode(params, agentDefs);
+  const inheritsConversationContext = sessionMode === "fork";
+  return {
+    sessionMode,
+    seededSessionMode: sessionMode === "standalone" ? null : sessionMode,
+    inheritsConversationContext,
+    taskDelivery: inheritsConversationContext ? "direct" : "artifact",
+  };
 }
 
 function formatElapsed(seconds: number): string {
@@ -437,6 +475,8 @@ export const __test__ = {
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
+  resolveEffectiveSessionMode,
+  resolveLaunchBehavior,
 };
 
 function startWidgetRefresh() {
@@ -496,10 +536,22 @@ async function launchSubagent(
     await new Promise<void>((resolve) => setTimeout(resolve, 500));
   }
 
+  const launchBehavior = resolveLaunchBehavior(params, agentDefs);
+
+  if (launchBehavior.seededSessionMode) {
+    seedSubagentSessionFile({
+      mode: launchBehavior.seededSessionMode,
+      parentSessionFile: sessionFile,
+      childSessionFile: subagentSessionFile,
+      childCwd: targetCwdForSession,
+    });
+  }
+
+  const { inheritsConversationContext } = launchBehavior;
+
   // Build the task message
-  // When forking, the sub-agent already has the full conversation context.
-  // Only send the user's task as a clean message — no wrapper instructions
-  // that would confuse the agent into thinking it needs to restart.
+  // Only full-context fork mode inherits prior conversation state.
+  // Blank-session modes need the wrapper instructions and artifact-backed handoff.
   const modeHint = agentDefs?.autoExit
     ? "Complete your task autonomously."
     : "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
@@ -513,65 +565,17 @@ async function launchSubagent(
     : `As your FIRST action, set the tab title using set_tab_title. ` +
       `The title MUST start with [${agentType}] followed by a short description of your current task. ` +
       `Example: "[${agentType}] Analyzing auth module". Keep it concise.`;
-  // Determine where the agent identity goes: system prompt or user message
   const identity = agentDefs?.body ?? params.systemPrompt ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
   const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
-  const fullTask = params.fork
+  const fullTask = inheritsConversationContext
     ? params.task
     : `${roleBlock}\n\n${modeHint}\n\n${tabTitleInstruction}\n\n${params.task}\n\n${summaryInstruction}`;
 
   // Build pi command
   const parts: string[] = ["pi"];
   parts.push("--session", shellEscape(subagentSessionFile));
-
-  // For fork mode, build the forked session file directly at subagentSessionFile.
-  // We write a new session header + cleaned entries (excluding the meta-message
-  // that triggered this fork). The sub-agent launches with just --session.
-  if (params.fork) {
-    const raw = readFileSync(sessionFile, "utf8");
-    const lines = raw.split("\n").filter((l) => l.trim());
-
-    // Walk backwards to find the last user message (the meta-instruction)
-    // and truncate everything from there onwards
-    let truncateAt = lines.length;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      try {
-        const entry = JSON.parse(lines[i]);
-        if (entry.type === "message" && entry.message?.role === "user") {
-          truncateAt = i;
-          break;
-        }
-      } catch {}
-    }
-
-    // Separate header from content entries
-    const cleanLines = lines.slice(0, truncateAt);
-    const contentLines = cleanLines.filter((l) => {
-      try {
-        return JSON.parse(l).type !== "session";
-      } catch {
-        return true;
-      }
-    });
-
-    // Write new session header + cleaned entries to the subagent session file
-    const newHeader = JSON.stringify({
-      type: "session",
-      version: 3,
-      id: randomUUID(),
-      timestamp: new Date().toISOString(),
-      cwd: process.cwd(),
-      parentSession: sessionFile,
-    });
-    mkdirSync(dirname(subagentSessionFile), { recursive: true });
-    writeFileSync(
-      subagentSessionFile,
-      newHeader + "\n" + contentLines.join("\n") + "\n",
-      "utf8",
-    );
-  }
 
   const subagentDonePath = join(dirname(new URL(import.meta.url).pathname), "subagent-done.ts");
   parts.push("-e", shellEscape(subagentDonePath));
@@ -645,11 +649,10 @@ async function launchSubagent(
   const envPrefix = envParts.join(" ") + " ";
 
   // Pass task to the sub-agent.
-  // For fork mode, pass as a plain quoted argument — the forked session already
-  // has the full conversation context, so the message arrives as if the user typed it.
-  // For non-fork mode, write to an artifact file and pass via @file to handle
-  // long task descriptions with role/instructions safely.
-  if (params.fork) {
+  // Only full-context fork mode gets a direct task argument because it already
+  // inherits the parent conversation. Blank-session modes use artifact-backed
+  // handoff so the wrapper instructions arrive as the initial user message.
+  if (launchBehavior.taskDelivery === "direct") {
     parts.push(shellEscape(fullTask));
   } else {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);

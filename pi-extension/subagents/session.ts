@@ -1,6 +1,6 @@
-import { readFileSync, appendFileSync, copyFileSync } from "node:fs";
-import { randomBytes } from "node:crypto";
-import { join } from "node:path";
+import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomBytes, randomUUID } from "node:crypto";
+import { dirname, join } from "node:path";
 
 export interface SessionEntry {
   type: string;
@@ -17,12 +17,61 @@ export interface MessageEntry extends SessionEntry {
   };
 }
 
+export type SeededSubagentSessionMode = "lineage-only" | "fork";
+
 function readEntries(sessionFile: string): SessionEntry[] {
   const raw = readFileSync(sessionFile, "utf8");
   return raw
     .split("\n")
     .filter((line) => line.trim())
     .map((line) => JSON.parse(line) as SessionEntry);
+}
+
+function getForkContentLines(parentSessionFile: string): string[] {
+  const raw = readFileSync(parentSessionFile, "utf8");
+  const lines = raw.split("\n").filter((line) => line.trim());
+
+  let truncateAt = lines.length;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const entry = JSON.parse(lines[i]);
+      if (entry.type === "message" && entry.message?.role === "user") {
+        truncateAt = i;
+        break;
+      }
+    } catch {
+      // ignore malformed lines and preserve current behavior
+    }
+  }
+
+  return lines.slice(0, truncateAt).filter((line) => {
+    try {
+      return JSON.parse(line).type !== "session";
+    } catch {
+      return true;
+    }
+  });
+}
+
+export function seedSubagentSessionFile(params: {
+  mode: SeededSubagentSessionMode;
+  parentSessionFile: string;
+  childSessionFile: string;
+  childCwd: string;
+}): void {
+  const header = {
+    type: "session",
+    version: 3,
+    id: randomUUID(),
+    timestamp: new Date().toISOString(),
+    cwd: params.childCwd,
+    parentSession: params.parentSessionFile,
+  };
+  const contentLines = params.mode === "fork" ? getForkContentLines(params.parentSessionFile) : [];
+  const lines = [JSON.stringify(header), ...contentLines];
+
+  mkdirSync(dirname(params.childSessionFile), { recursive: true });
+  writeFileSync(params.childSessionFile, lines.join("\n") + "\n", "utf8");
 }
 
 /**
@@ -121,4 +170,3 @@ export function mergeNewEntries(
   }
   return entries;
 }
-const unused = "hello";
