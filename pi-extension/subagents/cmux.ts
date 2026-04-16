@@ -663,6 +663,7 @@ export async function pollForExit(
   options: {
     interval: number;
     sessionFile?: string;
+    sentinelFile?: string;
     onTick?: (elapsed: number) => void;
   },
 ): Promise<PollResult> {
@@ -684,6 +685,15 @@ export async function pollForExit(
             return { reason: "ping", exitCode: 0, ping: { name: data.name, message: data.message } };
           }
           return { reason: "done", exitCode: 0 };
+        }
+      } catch {}
+    }
+
+    // Check Claude sentinel file (written by plugin Stop hook)
+    if (options.sentinelFile) {
+      try {
+        if (existsSync(options.sentinelFile)) {
+          return { reason: "sentinel", exitCode: 0 };
         }
       } catch {}
     }
