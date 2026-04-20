@@ -528,6 +528,38 @@ function updateWidget() {
   );
 }
 
+/**
+ * Build the positional prompt args for a Pi CLI subagent launch.
+ *
+ * In artifact-backed launches (lineage-only, standalone), Pi's buildInitialMessage()
+ * concatenates @file content with messages[0] into one initial prompt. That breaks
+ * /skill: expansion because the message no longer starts with "/skill:". Only
+ * messages[1..] are sent as separate follow-up prompts where /skill: is recognized.
+ *
+ * When there are skill prompts AND artifact-backed delivery, we prepend an empty
+ * first positional message so that /skill: args land in messages[1..] and arrive
+ * as standalone prompts in the child session.
+ */
+function buildPiPromptArgs(params: {
+  effectiveSkills?: string;
+  taskDelivery: "direct" | "artifact";
+  taskArg: string;
+}): string[] {
+  const skillPrompts = (params.effectiveSkills ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((skill) => `/skill:${skill}`);
+
+  const needsSeparator = params.taskDelivery === "artifact" && skillPrompts.length > 0;
+
+  return [
+    ...(needsSeparator ? [""] : []),
+    ...skillPrompts,
+    params.taskArg,
+  ];
+}
+
 export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
@@ -536,6 +568,7 @@ export const __test__ = {
   discoverAgentDefinitions,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
+  buildPiPromptArgs,
 };
 
 function startWidgetRefresh() {
@@ -739,15 +772,6 @@ async function launchSubagent(
     }
   }
 
-  if (effectiveSkills) {
-    for (const skill of effectiveSkills
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean)) {
-      parts.push(shellEscape(`/skill:${skill}`));
-    }
-  }
-
   // Build env prefix: denied tools + subagent identity + config dir propagation
   const envParts: string[] = [];
 
@@ -773,12 +797,13 @@ async function launchSubagent(
   envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
   const envPrefix = envParts.join(" ") + " ";
 
-  // Pass task to the sub-agent.
+  // Pass task and skill prompts to the sub-agent.
   // Only full-context fork mode gets a direct task argument because it already
   // inherits the parent conversation. Blank-session modes use artifact-backed
   // handoff so the wrapper instructions arrive as the initial user message.
+  let taskArg: string;
   if (launchBehavior.taskDelivery === "direct") {
-    parts.push(shellEscape(fullTask));
+    taskArg = fullTask;
   } else {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
     const safeName = params.name
@@ -791,7 +816,15 @@ async function launchSubagent(
     const artifactPath = join(artifactDir, artifactName);
     mkdirSync(dirname(artifactPath), { recursive: true });
     writeFileSync(artifactPath, fullTask, "utf8");
-    parts.push(shellEscape(`@${artifactPath}`));
+    taskArg = `@${artifactPath}`;
+  }
+
+  for (const promptArg of buildPiPromptArgs({
+    effectiveSkills,
+    taskDelivery: launchBehavior.taskDelivery,
+    taskArg,
+  })) {
+    parts.push(shellEscape(promptArg));
   }
 
   // Resolve cwd — param overrides agent default, supports absolute and relative paths.
