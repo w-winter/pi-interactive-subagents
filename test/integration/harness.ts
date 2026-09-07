@@ -36,7 +36,7 @@ import {
   parseCmuxFocusedSnapshotFromJson,
   parseCmuxPaneRefForSurfaceFromJson,
   type MuxBackend,
-} from "../../pi-extension/subagents/cmux.ts";
+} from "../../pi-extension/subagents/mux.ts";
 
 // Re-export mux primitives for tests
 export {

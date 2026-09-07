@@ -35,6 +35,7 @@ Supported multiplexers:
 - [tmux](https://github.com/tmux/tmux)
 - [zellij](https://zellij.dev)
 - [WezTerm](https://wezfurlong.org/wezterm/) (terminal emulator with built-in multiplexing)
+- [Orca](https://github.com/stablyai/orca) (AI orchestrator with built-in terminal multiplexing)
 
 Start pi inside one of them:
 
@@ -46,9 +47,15 @@ tmux new -A -s pi 'pi'
 zellij --session pi   # then run: pi
 # or
 # just run pi inside WezTerm — no wrapper needed
+# or
+# open a local Orca worktree terminal, then run: pi
 ```
 
-Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm` to force a specific backend.
+Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm|orca` to force a specific backend.
+
+[Orca](https://github.com/stablyai/orca) is an AI orchestrator with a built-in terminal multiplexer. It runs CLI coding agents in worktree-scoped terminal tabs and supports split terminal panes. When Pi runs in a local Orca worktree terminal, each subagent opens in a new background terminal tab in the same worktree without taking focus.
+
+Register Orca's bundled [`orca` CLI](https://www.onorca.dev/docs/cli/overview) under **Settings → General → Orca CLI**. Verify that `orca terminal read --help` lists `--screen`. To use another compatible Orca CLI executable, set `ORCA_CLI_COMMAND` to its command name or path.
 
 If your shell startup is slow and subagent commands sometimes get dropped before the prompt is ready, set `PI_SUBAGENT_SHELL_READY_DELAY_MS` to a higher value (defaults to `500`):
 
@@ -472,6 +479,7 @@ Every sub-agent session displays a compact tools widget showing available and de
   - [tmux](https://github.com/tmux/tmux)
   - [zellij](https://zellij.dev)
   - [WezTerm](https://wezfurlong.org/wezterm/)
+  - [Orca](https://github.com/stablyai/orca) (AI orchestrator with built-in terminal multiplexing)
 
 ```bash
 cmux pi
@@ -481,12 +489,14 @@ tmux new -A -s pi 'pi'
 zellij --session pi   # then run: pi
 # or
 # just run pi inside WezTerm
+# or
+# open a local Orca worktree terminal, then run: pi
 ```
 
 Optional backend override:
 
 ```bash
-export PI_SUBAGENT_MUX=cmux   # or tmux, zellij, wezterm
+export PI_SUBAGENT_MUX=cmux   # or tmux, zellij, wezterm, orca
 ```
 
 ---

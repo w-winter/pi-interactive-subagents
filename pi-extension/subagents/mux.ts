@@ -3,10 +3,11 @@ import { promisify } from "node:util";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import * as orca from "./orca.ts";
 
 const execFileAsync = promisify(execFile);
 
-export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm";
+export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm" | "orca";
 
 const commandAvailability = new Map<string, boolean>();
 
@@ -22,7 +23,7 @@ function hasCommand(command: string): boolean {
       available = true;
     } catch {
       try {
-        execSync(`command -v ${command}`, { stdio: "ignore" });
+        execSync(`command -v ${shellEscape(command)}`, { stdio: "ignore" });
         available = true;
       } catch {
         available = false;
@@ -30,7 +31,7 @@ function hasCommand(command: string): boolean {
     }
   } else {
     try {
-      execSync(`command -v ${command}`, { stdio: "ignore" });
+      execSync(`command -v ${shellEscape(command)}`, { stdio: "ignore" });
       available = true;
     } catch {
       available = false;
@@ -43,7 +44,7 @@ function hasCommand(command: string): boolean {
 
 function muxPreference(): MuxBackend | null {
   const pref = (process.env.PI_SUBAGENT_MUX ?? "").trim().toLowerCase();
-  if (pref === "cmux" || pref === "tmux" || pref === "zellij" || pref === "wezterm") return pref;
+  if (pref === "cmux" || pref === "tmux" || pref === "zellij" || pref === "wezterm" || pref === "orca") return pref;
   return null;
 }
 
@@ -81,6 +82,8 @@ export function isWezTermAvailable(): boolean {
 
 export function getMuxBackend(): MuxBackend | null {
   const pref = muxPreference();
+  const orcaAvailable = !!process.env.ORCA_TERMINAL_HANDLE && hasCommand(orca.cliCommand());
+  if (pref === "orca") return orcaAvailable ? "orca" : null;
   if (pref === "cmux") return isCmuxRuntimeAvailable() ? "cmux" : null;
   if (pref === "tmux") return isTmuxRuntimeAvailable() ? "tmux" : null;
   if (pref === "zellij") return isZellijRuntimeAvailable() ? "zellij" : null;
@@ -90,6 +93,7 @@ export function getMuxBackend(): MuxBackend | null {
   if (isTmuxRuntimeAvailable()) return "tmux";
   if (isZellijRuntimeAvailable()) return "zellij";
   if (isWezTermRuntimeAvailable()) return "wezterm";
+  if (orcaAvailable) return "orca";
   return null;
 }
 
@@ -99,6 +103,7 @@ export function isMuxAvailable(): boolean {
 
 export function muxSetupHint(): string {
   const pref = muxPreference();
+  if (pref === "orca") return "Start pi inside a local Orca terminal.";
   if (pref === "cmux") {
     return "Start pi inside cmux (`cmux pi`).";
   }
@@ -111,7 +116,7 @@ export function muxSetupHint(): string {
   if (pref === "wezterm") {
     return "Start pi inside WezTerm.";
   }
-  return "Start pi inside cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), or WezTerm.";
+  return "Start pi inside cmux (`cmux pi`), tmux (`tmux new -A -s pi 'pi'`), zellij (`zellij --session pi`, then run `pi`), WezTerm, or a local Orca terminal.";
 }
 
 function requireMuxBackend(): MuxBackend {
@@ -753,6 +758,7 @@ function createCmuxSplitSurface(
  */
 export function createSurface(name: string): string {
   const backend = getMuxBackend();
+  if (backend === "orca") return orca.createTab(name);
 
   if (backend === "cmux" && cmuxSubagentPane) {
     // Verify the pane still exists before adding a tab to it
@@ -818,6 +824,7 @@ export function createSurfaceSplit(
   fromSurface?: string,
 ): string {
   const backend = requireMuxBackend();
+  if (backend === "orca") throw new Error("Orca subagents use tabs, not splits. Use createSurface().");
 
   if (backend === "cmux") {
     return createCmuxSplitSurface(name, direction, fromSurface).surface;
@@ -909,6 +916,7 @@ export function createSurfaceSplit(
  */
 export function renameCurrentTab(title: string): void {
   const backend = requireMuxBackend();
+  if (backend === "orca") return orca.renameTab(title);
 
   if (backend === "cmux") {
     const surfaceId = process.env.CMUX_SURFACE_ID;
@@ -957,6 +965,7 @@ export function renameCurrentTab(title: string): void {
  */
 export function renameWorkspace(title: string): void {
   const backend = requireMuxBackend();
+  if (backend === "orca") return;
 
   if (backend === "cmux") {
     execSync(`cmux workspace-action --action rename --title ${shellEscape(title)}`, {
@@ -1010,6 +1019,7 @@ export function renameWorkspace(title: string): void {
  */
 export function sendCommand(surface: string, command: string): void {
   const backend = requireMuxBackend();
+  if (backend === "orca") return orca.sendCommand(surface, command);
 
   if (backend === "cmux") {
     execSync(`cmux send --surface ${shellEscape(surface)} ${shellEscape(command + "\n")}`, {
@@ -1042,6 +1052,7 @@ export function sendCommand(surface: string, command: string): void {
  */
 export function sendEscape(surface: string): void {
   const backend = requireMuxBackend();
+  if (backend === "orca") return orca.sendEscape(surface);
 
   if (backend === "cmux") {
     execFileSync("cmux", ["send", "--surface", surface, "\u001b"], { encoding: "utf8" });
@@ -1106,6 +1117,7 @@ export function sendLongCommand(
  */
 export function readScreen(surface: string, lines = 50): string {
   const backend = requireMuxBackend();
+  if (backend === "orca") return orca.readScreen(surface, lines);
 
   if (backend === "cmux") {
     return execSync(`cmux read-screen --surface ${shellEscape(surface)} --lines ${lines}`, {
@@ -1149,6 +1161,7 @@ export function readScreen(surface: string, lines = 50): string {
  */
 export async function readScreenAsync(surface: string, lines = 50): Promise<string> {
   const backend = requireMuxBackend();
+  if (backend === "orca") return orca.readScreenAsync(surface, lines);
 
   if (backend === "cmux") {
     const { stdout } = await execFileAsync(
@@ -1192,6 +1205,7 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
  */
 export function closeSurface(surface: string): void {
   const backend = requireMuxBackend();
+  if (backend === "orca") return orca.closeTab(surface);
 
   if (backend === "cmux") {
     execSync(`cmux close-surface --surface ${shellEscape(surface)}`, {

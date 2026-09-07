@@ -28,7 +28,7 @@ import {
   renameCurrentTab,
   renameWorkspace,
   readScreen,
-} from "./cmux.ts";
+} from "./mux.ts";
 
 import {
   findLastAssistantMessage,

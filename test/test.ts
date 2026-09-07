@@ -30,7 +30,7 @@ import {
   predictZellijSplitDirection,
   selectZellijPlacement,
   selectZellijStackPlacement,
-} from "../pi-extension/subagents/cmux.ts";
+} from "../pi-extension/subagents/mux.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -55,7 +55,7 @@ import subagentDoneExtension, {
   findLatestAssistantError,
   writeExitSidecarIfAbsent,
 } from "../pi-extension/subagents/subagent-done.ts";
-import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
+import { __pollForExitTest__ } from "../pi-extension/subagents/mux.ts";
 
 // --- Helpers ---
 
@@ -1522,7 +1522,7 @@ describe("subagent-done.ts", () => {
   });
 });
 
-describe("cmux.ts interpretExitSidecar", () => {
+describe("mux.ts interpretExitSidecar", () => {
   const { interpretExitSidecar } = __pollForExitTest__;
 
   it("decodes ping payloads", () => {
@@ -2376,7 +2376,7 @@ describe("subagents widget rendering", () => {
   });
 });
 
-describe("cmux.ts", () => {
+describe("mux.ts", () => {
   describe("shellEscape", () => {
     it("wraps in single quotes", () => {
       assert.equal(shellEscape("hello"), "'hello'");
