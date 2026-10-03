@@ -120,6 +120,8 @@ Multiple subagents run concurrently — each steers its result back independentl
 
 Completion messages render with a colored background and are expandable with `Ctrl+O` to show the full summary and session file path.
 
+The task determines the final assistant response's content and format.
+
 ### In-progress status updates
 
 The widget tracks each Pi-backed sub-agent from a child-written runtime snapshot and labels it with a coarse state:

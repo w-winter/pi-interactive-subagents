@@ -1037,8 +1037,8 @@ async function launchSubagent(
     ? "Complete your task autonomously."
     : "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
   const summaryInstruction = agentDefs?.autoExit
-    ? "Your FINAL assistant message should summarize what you accomplished."
-    : "Your FINAL assistant message (before calling subagent_done or before the user exits) should summarize what you accomplished.";
+    ? "Your FINAL assistant message must provide the deliverable requested by your task, in its requested format."
+    : "Your FINAL assistant message (before calling subagent_done or before the user exits) must provide the deliverable requested by your task, in its requested format.";
   const denySet = resolveDenyTools(agentDefs);
   const identity = agentDefs?.body ?? params.systemPrompt ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
