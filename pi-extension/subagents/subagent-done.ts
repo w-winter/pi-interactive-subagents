@@ -3,17 +3,22 @@
  * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+J)
  * - Provides a `subagent_done` tool for autonomous agents to self-terminate
  */
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { AgentEndEvent, ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
 
+// Auto-exit requires Pi's agent_settled event, absent from the pinned SDK typings.
+type SubagentExtensionAPI = Pick<ExtensionAPI, "on" | "registerTool" | "registerShortcut" | "getAllTools"> & {
+  on(event: "agent_settled", handler: (event: { type: "agent_settled" }, ctx: ExtensionContext) => void): void;
+};
+
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
 }
 
-export function shouldAutoExitOnAgentEnd(
+export function shouldAutoExitOnSettled(
   _userTookOver: boolean,
   messages: any[] | undefined,
 ): boolean {
@@ -39,13 +44,13 @@ export function shouldAutoExitOnAgentEnd(
 
 export interface SubagentErrorInfo {
   errorMessage: string;
-  stopReason: "error";
+  stopReason: "error" | "length";
 }
 
 type ChildExitSidecarPayload =
   | { type: "done" }
   | { type: "ping"; name: string; message: string }
-  | { type: "error"; errorMessage: string; stopReason: "error" }
+  | ({ type: "error" } & SubagentErrorInfo)
   | { type: "quit" };
 
 export type ExitSidecarWriteResult = "written" | "exists" | "missing-session" | "write-error";
@@ -67,15 +72,7 @@ export function writeExitSidecarIfAbsent(
   }
 }
 
-/**
- * If the last assistant message in the turn ended with `stopReason: "error"`
- * (typically auto-retry exhausted on an overload / rate limit / server error),
- * return its error info so the parent orchestrator can surface a clear
- * failure instead of silently treating the run as completed.
- *
- * Returns `null` when the latest assistant turn completed normally or was
- * aborted by the user (handled separately by shouldAutoExitOnAgentEnd).
- */
+/** Report provider failures and incomplete output from the latest assistant turn. */
 export function findLatestAssistantError(
   messages: any[] | undefined,
 ): SubagentErrorInfo | null {
@@ -83,6 +80,12 @@ export function findLatestAssistantError(
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     if (msg?.role !== "assistant") continue;
+    if (msg.stopReason === "length") {
+      return {
+        errorMessage: "Subagent reached the output token limit; its response is incomplete.",
+        stopReason: "length",
+      };
+    }
     if (msg.stopReason !== "error") return null;
     const raw = typeof msg.errorMessage === "string" ? msg.errorMessage.trim() : "";
     return {
@@ -100,7 +103,7 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
     .filter(Boolean);
 }
 
-export default function (pi: ExtensionAPI) {
+export default function (pi: SubagentExtensionAPI) {
   let toolNames: string[] = [];
   let denied: string[] = [];
   let expanded = false;
@@ -169,6 +172,7 @@ export default function (pi: ExtensionAPI) {
   let userTookOver = false;
   let agentStarted = false;
   let exitSidecarClaimed = false;
+  let completedMessages: AgentEndEvent["messages"] = [];
 
   function claimExitSidecar(
     sessionFile: string | undefined,
@@ -208,17 +212,16 @@ export default function (pi: ExtensionAPI) {
     recorder.agentStart();
   });
 
-  pi.on("agent_end", (event, ctx) => {
-    const messages = (event as any).messages as any[] | undefined;
-    const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
+  pi.on("agent_end", (event) => {
+    completedMessages = event.messages;
+  });
+
+  pi.on("agent_settled", (_event, ctx) => {
+    const shouldExit = autoExit && shouldAutoExitOnSettled(userTookOver, completedMessages);
 
     if (shouldExit) {
-      // Surface stopReason: "error" turns (auto-retry exhausted, provider
-      // overload, etc.) to the parent via the .exit sidecar so the watcher
-      // can report a clear failure with the underlying error message.
-      // Without this the parent would only see exit code 0 and a stale
-      // assistant message, mistaking the crash for a successful completion.
-      const errorInfo = findLatestAssistantError(messages);
+      // The last low-level run may have failed before Pi completed recovery.
+      const errorInfo = findLatestAssistantError(completedMessages);
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       if (errorInfo) {
         claimExitSidecar(sessionFile, {

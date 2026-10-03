@@ -456,15 +456,12 @@ function resolveResultPresentation(
   }
 
   if (result.errorMessage) {
-    // Auto-retry exhausted or other agent-loop error. The subagent did not
-    // produce a usable result — surface the underlying provider/network
-    // failure so the orchestrator can decide whether to retry, resume, or
-    // change approach instead of silently treating the run as completed.
+    // Partial output must not be presented as a completed result.
     return (
       `Sub-agent "${name}" failed after ${formatElapsed(result.elapsed)} ` +
-      `(provider/agent error — auto-retry exhausted).\n\n` +
+      `(provider/agent error).\n\n` +
       `Error: ${result.errorMessage}\n\n` +
-      `The subagent did not produce a result. You can retry by spawning a new ` +
+      `The subagent did not produce a complete result. You can retry by spawning a new ` +
       `subagent or resume the session with subagent_resume.${sessionRef}`
     );
   }
@@ -2079,7 +2076,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           .replace(`Sub-agent "${name}" failed (exit code ${exitCode}).\n\n`, "")
           .replace(
             new RegExp(
-              `^Sub-agent "${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}" failed after ${elapsed} \\(provider/agent error — auto-retry exhausted\\)\\.\\n\\n`,
+              `^Sub-agent "${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}" failed after ${elapsed} \\(provider/agent error\\)\\.\\n\\n`,
             ),
             "",
           );

@@ -51,7 +51,7 @@ import {
 } from "../pi-extension/subagents/activity.ts";
 import subagentDoneExtension, {
   shouldMarkUserTookOver,
-  shouldAutoExitOnAgentEnd,
+  shouldAutoExitOnSettled,
   findLatestAssistantError,
   writeExitSidecarIfAbsent,
 } from "../pi-extension/subagents/subagent-done.ts";
@@ -1292,6 +1292,7 @@ describe("subagent-done.ts", () => {
       try {
         subagentDoneExtension(api);
         handlers.get("agent_end")?.({ messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
+        handlers.get("agent_settled")?.({}, ctx);
         assert.equal(shutdownCalled, true);
         assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), { type: "done" });
 
@@ -1329,6 +1330,7 @@ describe("subagent-done.ts", () => {
         handlers.get("agent_end")?.({
           messages: [{ role: "assistant", stopReason: "error", errorMessage: "529 overloaded" }],
         }, ctx);
+        handlers.get("agent_settled")?.({}, ctx);
         assert.equal(shutdownCalled, true);
         assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), expectedSidecar);
 
@@ -1373,6 +1375,7 @@ describe("subagent-done.ts", () => {
       try {
         subagentDoneExtension(api);
         handlers.get("agent_end")?.({ messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
+        handlers.get("agent_settled")?.({}, ctx);
 
         mkdirSync(sessionDir);
         handlers.get("session_shutdown")?.({ reason: "quit" });
@@ -1455,20 +1458,20 @@ describe("subagent-done.ts", () => {
     });
   });
 
-  describe("shouldAutoExitOnAgentEnd", () => {
+  describe("shouldAutoExitOnSettled", () => {
     it("auto-exits after normal completion when there was no takeover", () => {
       const messages = [{ role: "assistant", stopReason: "stop" }];
-      assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
+      assert.equal(shouldAutoExitOnSettled(false, messages), true);
     });
 
     it("auto-exits after normal completion even when the user sent the prompt", () => {
       const messages = [{ role: "assistant", stopReason: "stop" }];
-      assert.equal(shouldAutoExitOnAgentEnd(true, messages), true);
+      assert.equal(shouldAutoExitOnSettled(true, messages), true);
     });
 
     it("stays open after Escape aborts the run", () => {
       const messages = [{ role: "assistant", stopReason: "aborted" }];
-      assert.equal(shouldAutoExitOnAgentEnd(false, messages), false);
+      assert.equal(shouldAutoExitOnSettled(false, messages), false);
     });
 
     it("still exits when the latest turn ended with stopReason=error", () => {
@@ -1476,7 +1479,7 @@ describe("subagent-done.ts", () => {
       // parent is woken. The error sidecar (written separately) carries the
       // failure detail; staying open would just strand the worker.
       const messages = [{ role: "assistant", stopReason: "error", errorMessage: "529 overloaded" }];
-      assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
+      assert.equal(shouldAutoExitOnSettled(false, messages), true);
     });
   });
 
@@ -2127,7 +2130,7 @@ describe("subagent interruption", () => {
     );
 
     assert.match(presentation, /Sub-agent "Worker" failed/);
-    assert.match(presentation, /provider\/agent error — auto-retry exhausted/);
+    assert.match(presentation, /provider\/agent error/);
     assert.match(presentation, /Error: Anthropic 529 Overloaded after 3 retries/);
     assert.match(presentation, /subagent_resume/);
     assert.match(presentation, /Resume: pi --session/);

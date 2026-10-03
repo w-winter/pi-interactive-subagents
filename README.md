@@ -339,12 +339,13 @@ session-mode: lineage-only
 
 ### `auto-exit`
 
-When set to `true`, the agent session shuts down automatically as soon as the agent finishes its turn — no explicit `subagent_done` call is needed.
+When set to `true`, the agent session shuts down automatically after Pi finishes the run, including automatic recovery and queued work. Auto-exit requires a Pi runtime that emits `agent_settled`.
 
 **Behavior:**
 
-- The session closes after the agent's final message (on the `agent_end` event)
-- If the user sends **any input** before the agent finishes, auto-exit is permanently disabled for that session — the user takes over interactively
+- The session closes on `agent_settled`, after the final response
+- Provider failures and output-token-limit truncation are reported to the parent as errors; partial responses remain in the session transcript
+- Interrupting a turn leaves the session open for inspection or resumption; a later completed turn can still auto-exit
 - The modeHint injected into the agent's task is adjusted accordingly: autonomous agents see "Complete your task autonomously." rather than instructions to call `subagent_done`
 
 **When to use:**
