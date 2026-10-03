@@ -8,9 +8,10 @@ import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import { parseConversationProfile } from "./conversation-profile.ts";
 
 // Auto-exit requires Pi's agent_settled event, absent from the pinned SDK typings.
-type SubagentExtensionAPI = Pick<ExtensionAPI, "on" | "registerTool" | "registerShortcut" | "getAllTools"> & {
+type SubagentExtensionAPI = Pick<ExtensionAPI, "on" | "registerTool" | "registerShortcut" | "getAllTools" | "appendEntry"> & {
   on(event: "agent_settled", handler: (event: { type: "agent_settled" }, ctx: ExtensionContext) => void): void;
 };
 
@@ -187,6 +188,8 @@ export default function (pi: SubagentExtensionAPI) {
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
+    const profileJson = process.env.PI_SUBAGENT_CONVERSATION_PROFILE;
+    if (profileJson) pi.appendEntry("subagent-conversation", parseConversationProfile(profileJson));
     recorder.sessionStart();
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();

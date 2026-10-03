@@ -176,6 +176,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | ---------------------- | ------- | -------------- | ------------------------------------------------------------------------------------------------- |
 | `name`                 | string  | required       | Display name (shown in widget and pane title)                                                     |
 | `task`                 | string  | required       | Task prompt for the sub-agent                                                                     |
+| `inputFiles`           | string[] | omitted       | Absolute file paths attached to the initial prompt through Pi's `@file` handling |
 | `agent`                | string  | —              | Load defaults from agent definition                                                               |
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
@@ -303,7 +304,9 @@ You are a specialized agent that does X...
 | `name`        | string  | Agent name (used in `agent: "my-agent"`)                                                                                                                                                                                                                                    |
 | `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
 | `model`       | string  | Default model (e.g. `anthropic/claude-sonnet-4-6`)                                                                                                                                                                                                                          |
-| `thinking`    | string  | Thinking level: `minimal`, `medium`, `high`                                                                                                                                                                                                                                 |
+| `thinking`    | string  | Explicit thinking level, including `off`; passed through `--thinking` so it overrides a model suffix |
+| `system-prompt` | string | `append` adds the definition body to the system prompt; `replace` replaces the default preamble. Context files and appendices are separate resources. |
+| `profile` | string | `conversation` runs a fresh, tool-free Pi session with only the supplied role instructions and input |
 | `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
@@ -336,6 +339,27 @@ name: planner
 session-mode: lineage-only
 ---
 ```
+
+### Conversation profile
+
+Use `profile: conversation` for a model that should answer from supplied text rather than operate tools. It requires an explicit model, a nonempty definition body, and `system-prompt: replace`. Use `standalone` or `lineage-only`; conversation forks, skill prompts, tool overrides, and the Claude CLI launch path are rejected.
+
+```yaml
+---
+name: analyst
+model: example/text-model
+thinking: off
+profile: conversation
+system-prompt: replace
+session-mode: lineage-only
+auto-exit: true
+---
+Analyze the supplied material and return your complete answer directly.
+```
+
+The profile disables tool declarations and discovery of context files, skills, prompt templates, and other extensions. It also suppresses `APPEND_SYSTEM.md`. The lifecycle extension still records progress and completion, but its tools are disabled. Pi retains working-directory metadata; the definition supplies the role instructions. Providers configured through Pi's model configuration remain available; providers that require another extension are not loaded by this profile.
+
+Pass source documents using `inputFiles`, not paths that the model would need a tool to read. The parent receives the answer through the usual completion result, and the full text remains in the session transcript. The caller owns any separate output-file export. Resuming through `subagent_resume` restores the recorded model, thinking level, configuration directory, working directory, and system-prompt file together with the conversation restrictions. Keep that system-prompt file while the session may be resumed; a missing file is an error.
 
 ### `auto-exit`
 

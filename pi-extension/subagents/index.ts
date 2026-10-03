@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   readdirSync,
@@ -14,6 +14,7 @@ import {
   unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
+import { buildModelArgs, conversationArgs, readConversationProfile, type ConversationProfile } from "./conversation-profile.ts";
 import {
   isMuxAvailable,
   muxSetupHint,
@@ -88,6 +89,7 @@ function getModuleAbortSignal(): AbortSignal {
 const SubagentParams = Type.Object({
   name: Type.String({ description: "Display name for the subagent" }),
   task: Type.String({ description: "Task/prompt for the sub-agent" }),
+  inputFiles: Type.Optional(Type.Array(Type.String({ description: "Absolute path to a file attached in full to the child's initial prompt" }))),
   agent: Type.Optional(
     Type.String({
       description:
@@ -133,6 +135,7 @@ const SubagentParams = Type.Object({
 type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
 interface AgentDefaults {
+  profile?: "conversation";
   model?: string;
   tools?: string;
   skills?: string;
@@ -228,8 +231,14 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
   const frontmatter = match[1];
   const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
   const systemPromptMode = getFrontmatterValue(frontmatter, "system-prompt");
+  const profile = getFrontmatterValue(frontmatter, "profile");
+  if (profile !== undefined && profile !== "conversation") throw new Error(`Unsupported agent profile: ${profile}`);
+  if (profile === "conversation" && (systemPromptMode !== "replace" || !body)) {
+    throw new Error("Conversation agents require system-prompt: replace and a nonempty prompt body");
+  }
 
   return {
+    profile,
     name: getFrontmatterValue(frontmatter, "name") ?? fallbackName,
     description: getFrontmatterValue(frontmatter, "description"),
     model: getFrontmatterValue(frontmatter, "model"),
@@ -696,18 +705,24 @@ function buildPiPromptArgs(params: {
   effectiveSkills?: string;
   taskDelivery: "direct" | "artifact";
   taskArg: string;
+  inputFiles?: string[];
 }): string[] {
+  const inputFiles = params.inputFiles ?? [];
+  for (const path of inputFiles) {
+    if (!isAbsolute(path)) throw new Error("Subagent inputFiles must use absolute paths");
+  }
   const skillPrompts = (params.effectiveSkills ?? "")
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean)
     .map((skill) => `/skill:${skill}`);
 
-  const needsSeparator = params.taskDelivery === "artifact" && skillPrompts.length > 0;
+  const needsSeparator = (params.taskDelivery === "artifact" || inputFiles.length > 0) && skillPrompts.length > 0;
 
   return [
     ...(needsSeparator ? [""] : []),
     ...skillPrompts,
+    ...inputFiles.map((path) => `@${path}`),
     params.taskArg,
   ];
 }
@@ -965,6 +980,13 @@ async function launchSubagent(
   const effectiveSkills = params.skills ?? agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
+  const isConversation = agentDefs?.profile === "conversation";
+  const launchBehavior = resolveLaunchBehavior(params, agentDefs);
+  if (isConversation && (!effectiveModel || effectiveSkills || effectiveTools ||
+      launchBehavior.inheritsConversationContext || agentDefs.cli === "claude")) {
+    throw new Error("Conversation agents require an explicit model, a fresh Pi session, and no skills or tool overrides");
+  }
+  buildPiPromptArgs({ taskDelivery: launchBehavior.taskDelivery, taskArg: "", inputFiles: params.inputFiles });
 
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
@@ -995,8 +1017,6 @@ async function launchSubagent(
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
 
-  const launchBehavior = resolveLaunchBehavior(params, agentDefs);
-
   if (launchBehavior.seededSessionMode) {
     seedSubagentSessionFile({
       mode: launchBehavior.seededSessionMode,
@@ -1024,7 +1044,7 @@ async function launchSubagent(
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
   const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
-  const fullTask = inheritsConversationContext
+  const fullTask = inheritsConversationContext || isConversation
     ? params.task
     : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
   // ── Claude Code CLI path ──
@@ -1109,10 +1129,8 @@ async function launchSubagent(
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
   parts.push("-e", shellEscape(subagentDonePath));
 
-  if (effectiveModel) {
-    const model = effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel;
-    parts.push("--model", shellEscape(model));
-  }
+  if (!isConversation) parts.push(...buildModelArgs(effectiveModel, effectiveThinking).map(shellEscape));
+  let conversationProfile: ConversationProfile | null = null;
 
   // Pass agent body as system prompt via file to avoid shell escaping issues
   // with multiline content. Pi's --append-system-prompt and --system-prompt
@@ -1129,7 +1147,15 @@ async function launchSubagent(
     const syspromptPath = join(artifactDir, `context/${spSafeName || "subagent"}-sysprompt-${spTimestamp}.md`);
     mkdirSync(dirname(syspromptPath), { recursive: true });
     writeFileSync(syspromptPath, identity, "utf8");
-    parts.push(flag, shellEscape(syspromptPath));
+    if (isConversation && effectiveModel) {
+      conversationProfile = {
+        systemPromptPath: syspromptPath, cwd: targetCwdForSession, agentDir: effectiveAgentDir,
+        model: effectiveModel, thinking: effectiveThinking ?? null,
+      };
+      parts.push(...conversationArgs(conversationProfile).map(shellEscape));
+    } else {
+      parts.push(flag, shellEscape(syspromptPath));
+    }
   }
 
   const toolAllowlist = buildSubagentToolAllowlist(effectiveTools);
@@ -1162,6 +1188,9 @@ async function launchSubagent(
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
   envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
+  if (conversationProfile) {
+    envParts.push(`PI_SUBAGENT_CONVERSATION_PROFILE=${shellEscape(JSON.stringify(conversationProfile))}`);
+  }
   const envPrefix = envParts.join(" ") + " ";
 
   // Pass task and skill prompts to the sub-agent.
@@ -1190,6 +1219,7 @@ async function launchSubagent(
     effectiveSkills,
     taskDelivery: launchBehavior.taskDelivery,
     taskArg,
+    inputFiles: params.inputFiles,
   })) {
     parts.push(shellEscape(promptArg));
   }
@@ -1826,7 +1856,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Record entry count before resuming so we can extract new messages
-        const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
+        const entriesBefore = getNewEntries(params.sessionPath, 0);
+        const entryCountBefore = entriesBefore.length;
+        const conversationProfile = readConversationProfile(entriesBefore);
+        if (conversationProfile && !existsSync(conversationProfile.systemPromptPath)) {
+          throw new Error(`Conversation system prompt is missing: ${conversationProfile.systemPromptPath}`);
+        }
 
         const surface = createSurface(name);
         await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
@@ -1837,6 +1872,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Load subagent-done extension so the agent can self-terminate if needed
         const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
         parts.push("-e", shellEscape(subagentDonePath));
+        if (conversationProfile) parts.push(...conversationArgs(conversationProfile).map(shellEscape));
 
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
@@ -1863,7 +1899,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
         const resumeEnvParts: string[] = [];
-        if (process.env.PI_CODING_AGENT_DIR) {
+        if (conversationProfile) {
+          resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(conversationProfile.agentDir)}`);
+          resumeEnvParts.push(`PI_SUBAGENT_CONVERSATION_PROFILE=${shellEscape(JSON.stringify(conversationProfile))}`);
+        } else if (process.env.PI_CODING_AGENT_DIR) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
         }
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
@@ -1875,7 +1914,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
-        const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const cdPrefix = conversationProfile ? `cd ${shellEscape(conversationProfile.cwd)} && ` : "";
+        const command = `${cdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
