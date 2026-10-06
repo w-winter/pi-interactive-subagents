@@ -189,6 +189,10 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |
 | `cwd`                  | string  | —              | Working directory for the sub-agent (see [Role Folders](#role-folders))                           |
 
+### Launching by command
+
+Use `/subagent <agent> [task]` to launch a named agent. Press Tab after `/subagent ` or a partial name to complete the agent name; matching is case-insensitive. Completions show descriptions and use project-over-global precedence. Agents with `disable-model-invocation: true` are available here for manual selection. Once you start typing the task, agent-name completion stops.
+
 ### Model and thinking selection
 
 Agent definitions supply the initial model and thinking level. Tool arguments override these defaults. Pi resolves the model reference and clamps thinking to the model's supported levels.
@@ -318,7 +322,7 @@ You are a specialized agent that does X...
 | `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
-| `disable-model-invocation` | boolean | Hide this agent from discovery surfaces like `subagents_list`. The agent still remains directly invokable by explicit name via `subagent({ agent: "name", ... })`. |
+| `disable-model-invocation` | boolean | Hide this agent from model-facing discovery such as `subagents_list`. It remains available by explicit name and in manual `/subagent` completion. |
 
 ---
 

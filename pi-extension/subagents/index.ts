@@ -2030,6 +2030,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // /subagent command — spawn a subagent by name
   pi.registerCommand("subagent", {
     description: "Spawn a subagent: /subagent <agent> <task>",
+    getArgumentCompletions: (argumentPrefix) => {
+      const prefix = argumentPrefix.trimStart();
+      if (/\s/.test(prefix)) return null;
+      const matches = discoverAgentDefinitions()
+        .filter((agent) => agent.name.toLowerCase().startsWith(prefix.toLowerCase()))
+        .map((agent) => ({ value: agent.name, label: agent.name, description: agent.description }));
+      return matches.length > 0 ? matches : null;
+    },
     handler: async (args, ctx) => {
       const trimmed = args.trim();
       if (!trimmed) {
