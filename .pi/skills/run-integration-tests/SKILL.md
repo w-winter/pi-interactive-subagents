@@ -79,6 +79,10 @@ Override defaults with environment variables:
 | `PI_TEST_MODEL` | `anthropic/claude-haiku-4-5` | Model for LLM-backed tests |
 | `PI_TEST_TIMEOUT` | `120000` | Per-test timeout in ms |
 
+Set `PI_TEST_MODEL` before starting the suite. When created, the test environment writes that selection into isolated `test-echo` and `test-ping` definitions and uses it for parent launches. Do not edit the checked-in agent fixtures to change providers. Select a different model for an individual test with `createTestEnv(backend, model)`.
+
+Check the `model_change` entries in both the parent and child sessions against the provider and model resolved by Pi. A bare fork inherits the parent's selection. Later resumes restore the child's recorded model and thinking level.
+
 ## Step 4: Introspect Sessions
 
 After tests pass, verify the sessions created during the test run are well-formed. Find them by looking for session directories matching the temp dir pattern:

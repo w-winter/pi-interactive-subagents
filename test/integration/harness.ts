@@ -12,11 +12,11 @@ import { execFileSync } from "node:child_process";
 import {
   mkdtempSync,
   mkdirSync,
-  cpSync,
   readdirSync,
   rmSync,
   existsSync,
   readFileSync,
+  writeFileSync,
   unlinkSync,
 } from "node:fs";
 import { join, resolve, dirname } from "node:path";
@@ -183,6 +183,8 @@ export async function waitForFocusedSurface(
 export interface TestEnv {
   /** Temp directory serving as the test project root */
   dir: string;
+  /** Model shared by parent launches and generated child definitions. */
+  model: string;
   /** Active mux backend for this test run */
   backend: MuxBackend;
   /** Surfaces created during the test (cleaned up automatically) */
@@ -193,23 +195,25 @@ export interface TestEnv {
 
 /**
  * Create an isolated test environment with test agent definitions.
- * The temp dir has `.pi/agents/` containing copies of all test agents.
+ * The temp dir has `.pi/agents/` containing test agents with the selected model.
  */
-export function createTestEnv(backend: MuxBackend): TestEnv {
+export function createTestEnv(backend: MuxBackend, model = TEST_MODEL): TestEnv {
+  if (!model.trim() || /[\r\n]/.test(model)) throw new Error("Test model must be a nonempty single-line reference");
   const dir = mkdtempSync(join(tmpdir(), "pi-integ-"));
   const agentsDir = join(dir, ".pi", "agents");
   mkdirSync(agentsDir, { recursive: true });
 
-  // Copy test agent definitions into the project-local agents dir
+  // Materialize the selected model in each isolated definition.
   if (existsSync(TEST_AGENTS_SRC)) {
     for (const file of readdirSync(TEST_AGENTS_SRC)) {
       if (file.endsWith(".md")) {
-        cpSync(join(TEST_AGENTS_SRC, file), join(agentsDir, file));
+        const content = readFileSync(join(TEST_AGENTS_SRC, file), "utf8");
+        writeFileSync(join(agentsDir, file), content.replace(/^---\n/, `---\nmodel: ${model}\n`));
       }
     }
   }
 
-  return { dir, backend, surfaces: [], tempFiles: [] };
+  return { dir, model, backend, surfaces: [], tempFiles: [] };
 }
 
 /**
@@ -269,11 +273,10 @@ export function untrackSurface(env: TestEnv, surface: string): void {
  */
 export function startPi(
   surface: string,
-  testDir: string,
+  env: TestEnv,
   task: string,
-  opts?: { model?: string; extraArgs?: string },
+  opts?: { extraArgs?: string },
 ): void {
-  const model = opts?.model ?? TEST_MODEL;
   const extra = opts?.extraArgs ?? "";
 
   // Force pi to load the working-tree extension (not an installed pi-package
@@ -281,11 +284,11 @@ export function startPi(
   // current branch's source directly. Without this, the tests silently run
   // against whatever version is checked out under `~/.pi/agent/git/...`.
   const cmd = [
-    `cd ${shellEscape(testDir)} &&`,
+    `cd ${shellEscape(env.dir)} &&`,
     `pi`,
     `-ne`,
     `-e ${shellEscape(EXTENSION_SOURCE)}`,
-    `--model ${shellEscape(model)}`,
+    `--model ${shellEscape(env.model)}`,
     extra,
     shellEscape(task),
   ]
@@ -293,7 +296,7 @@ export function startPi(
     .join(" ");
 
   sendLongCommand(surface, `${cmd}; echo '__TEST_DONE_'$?'__'`, {
-    scriptPath: join(testDir, `test-launch-${Date.now()}.sh`),
+    scriptPath: join(env.dir, `test-launch-${Date.now()}.sh`),
   });
 }
 

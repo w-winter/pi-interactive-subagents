@@ -199,6 +199,8 @@ The guard applies to Pi's extension setter API. Extensions execute inside the Pi
 
 Run `npm run test:model-guard` to test the installed Pi at `/opt/homebrew/bin/pi` with a local fake provider. The test checks startup, model requests, manual changes, reload, and resume. It writes a receipt and session transcript to `test/artifacts/model-guard/`.
 
+The live integration suite uses `PI_TEST_MODEL` for parent sessions and generated child definitions, with `anthropic/claude-haiku-4-5` as the default. Set it before running `npm run test:integration` to choose another model. These tests make model calls and create terminals; `npm test` uses fake providers and CLI executables.
+
 ---
 
 ## Interrupting a running subagent

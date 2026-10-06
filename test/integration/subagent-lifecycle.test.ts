@@ -78,7 +78,7 @@ for (const backend of backends) {
         `After you receive the subagent result, say INTEGRATION_COMPLETE.`,
       ].join("\n");
 
-      startPi(surface, env.dir, task);
+      startPi(surface, env, task);
 
       // Verify: subagent created the marker file
       const content = await waitForFile(markerFile, PI_TIMEOUT, /PASS/);
@@ -130,7 +130,7 @@ for (const backend of backends) {
         `After you receive the subagent result, say STATUS_TEST_DONE.`,
       ].join("\n");
 
-      startPi(surface, env.dir, task);
+      startPi(surface, env, task);
 
       const activeScreen = await waitForScreen(surface, /active[\s\S]*bash|bash[\s\S]*active/i, PI_TIMEOUT, 300);
       assert.doesNotMatch(activeScreen, /Subagent status[\s\S]*stalled|stalled[\s\S]*Subagent status/i);
@@ -182,7 +182,7 @@ for (const backend of backends) {
         `Call both subagent tools NOW, do not wait between them.`,
       ].join("\n");
 
-      startPi(surface, env.dir, task);
+      startPi(surface, env, task);
 
       // Both marker files should appear
       const [contentA, contentB] = await Promise.all([
@@ -208,12 +208,12 @@ for (const backend of backends) {
         `Call the subagent tool with these EXACT parameters:`,
         `  name: "Fork-${id}"`,
         `  fork: true`,
-        `  task: "Run this bash command: echo 'FORK_OK_${id}' > '${markerFile}'"`,
+        `  task: "Run this bash command: echo 'FORK_OK_${id}' > '${markerFile}'. Then call subagent_done to return the result."`,
         `Do not set the agent parameter. Just set name, fork, and task.`,
         `After you receive the result, say FORK_COMPLETE.`,
       ].join("\n");
 
-      startPi(surface, env.dir, task);
+      startPi(surface, env, task);
 
       // Verify: forked subagent created the file
       const content = await waitForFile(markerFile, PI_TIMEOUT, /FORK_OK/);
@@ -260,7 +260,7 @@ for (const backend of backends) {
         `Just call the subagent tool once. Do not do anything else before calling it.`,
       ].join("\n");
 
-      startPi(surface, env.dir, task);
+      startPi(surface, env, task);
 
       // The test-ping agent calls caller_ping, which steers a "needs help" message
       // back to the outer pi. Look for it on screen.
@@ -297,7 +297,7 @@ for (const backend of backends) {
         `After you receive the subagent result, say DISCOVERY_DONE.`,
       ].join("\n");
 
-      startPi(surface, env.dir, task);
+      startPi(surface, env, task);
 
       // The test-echo agent (discovered from project .pi/agents/) should work
       const content = await waitForFile(markerFile, PI_TIMEOUT, /DISCO/);
@@ -323,7 +323,7 @@ for (const backend of backends) {
         `After the subagent completes, say SYSPROMPT_TEST_DONE.`,
       ].join("\n");
 
-      startPi(surface, env.dir, task);
+      startPi(surface, env, task);
 
       const content = await waitForFile(markerFile, PI_TIMEOUT, /SYSPROMPT/);
       assert.ok(content.includes(`SYSPROMPT_${id}`), `System prompt test marker should exist`);

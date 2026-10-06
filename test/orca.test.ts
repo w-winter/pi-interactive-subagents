@@ -6,7 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Value } from "@sinclair/typebox/value";
-import subagentsExtension from "../pi-extension/subagents/index.ts";
+import subagentsExtension, { __test__ } from "../pi-extension/subagents/index.ts";
+import { createTestEnv, startPi } from "./integration/harness.ts";
 import { pollForExit } from "../pi-extension/subagents/completion.ts";
 import {
   createSurface, getMuxBackend, sendCommand, sendEscape, readScreen,
@@ -223,6 +224,22 @@ describe("Orca backend", () => {
     mkdirSync(agentDir, { recursive: true });
     writeFileSync(join(agentDir, "lifecycle-claude.md"), "---\ncli: claude\n---\nTest agent.\n");
     writeFileSync(join(agentDir, "lifecycle-interactive.md"), "---\nsystem-prompt: replace\n---\nWait for the user's next request.\n");
+    const modelEnv = createTestEnv("orca", "fixture/selected-model");
+    const previousCwd = process.cwd();
+    process.chdir(modelEnv.dir);
+    t.after(() => {
+      process.chdir(previousCwd);
+      execFileSync("trash", [modelEnv.dir]);
+    });
+    assert.equal(modelEnv.model, "fixture/selected-model");
+    for (const name of ["test-echo", "test-ping"]) {
+      assert.equal(__test__.loadAgentDefaults(name)?.model, modelEnv.model);
+    }
+    startPi("term_parent", modelEnv, "Test the selected model");
+    const parentScript = readdirSync(modelEnv.dir).find((name) => name.startsWith("test-launch-"));
+    assert.ok(parentScript);
+    const parentCommand = readFileSync(join(modelEnv.dir, parentScript), "utf8");
+    assert.match(parentCommand, /--model 'fixture\/selected-model'/);
     const sessionFile = join(directory, "parent.jsonl");
     writeFileSync(sessionFile, [
       { type: "session", version: 3, id: "lifecycle-test", cwd: directory },
@@ -242,6 +259,7 @@ describe("Orca backend", () => {
     const cases = [
       { tool: "subagent", params: { name: "Fresh child", task: "Wait", cwd: directory } },
       { tool: "subagent", params: { name: "Interactive child", task: "Wait", agent: "lifecycle-interactive", cwd: directory } },
+      { tool: "subagent", params: { name: "Selected model child", task: "Wait", agent: "test-echo", cwd: modelEnv.dir } },
       { tool: "subagent_resume", params: { name: "Resumed child", sessionPath: sessionFile, autoExit: false } },
       { tool: "subagent", params: { name: "Claude child", task: "Wait", agent: "lifecycle-claude", cwd: directory } },
     ];
@@ -252,6 +270,12 @@ describe("Orca backend", () => {
       assert.ok(tool);
       await tool.execute("launch", entry.params, undefined, undefined, ctx);
       const message = await completed;
+      if (entry.params.name === "Selected model child") {
+        const scriptDir = join(directory, "artifacts", "lifecycle-test", "subagent-scripts");
+        const script = readdirSync(scriptDir).find((name) => name.startsWith("selected-model-child-"));
+        assert.ok(script);
+        assert.match(readFileSync(join(scriptDir, script), "utf8"), /'--model' 'fixture\/selected-model'/);
+      }
       if (entry.params.name === "Fresh child" || entry.params.name === "Interactive child") {
         const contextDir = join(directory, "artifacts", "lifecycle-test", "context");
         const taskFiles = readdirSync(contextDir).filter((name) => !name.includes("sysprompt"));
@@ -277,7 +301,7 @@ describe("Orca backend", () => {
     }
     const artifacts = join(import.meta.dirname, "artifacts", "terminal-lifecycle");
     mkdirSync(artifacts, { recursive: true });
-    writeFileSync(join(artifacts, "receipt.json"), JSON.stringify({ results: receipt, paidRequests: 0 }, null, 2) + "\n");
+    writeFileSync(join(artifacts, "receipt.json"), JSON.stringify({ results: receipt, parentCommand, model: modelEnv.model, paidRequests: 0 }, null, 2) + "\n");
     t.diagnostic(`Verification artifact: ${artifacts}/receipt.json`);
   });
 });
