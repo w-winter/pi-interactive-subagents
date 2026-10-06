@@ -15,13 +15,12 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { buildModelArgs, buildResumeArgs, conversationArgs, readConversationProfile, type ConversationProfile } from "./conversation-profile.ts";
+import { pollForExit, type PollResult } from "./completion.ts";
 import {
   isMuxAvailable,
   muxSetupHint,
   createSurface,
   sendLongCommand,
-  pollForExit,
-  type PollResult,
   closeSurface,
   getMuxBackend,
   sendEscape,
@@ -1323,16 +1322,18 @@ async function watchSubagent(
         } catch {}
       }
 
-      if (!summary) {
+      if (!summary && result.reason !== "quit") {
         summary = readScreen(surface, 200)
           .replace(/__SUBAGENT_DONE_\d+__/, "")
           .trimEnd();
       }
 
       if (!summary) {
-        summary = result.exitCode !== 0
-          ? `Claude Code exited with code ${result.exitCode}`
-          : "Claude Code exited without output";
+        summary = result.reason === "quit"
+          ? "Claude Code session was closed by the user."
+          : result.exitCode !== 0
+            ? `Claude Code exited with code ${result.exitCode}`
+            : "Claude Code exited without output";
       }
 
       // Copy Claude session transcript

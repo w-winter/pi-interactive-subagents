@@ -9,6 +9,11 @@ const Parent = Type.Object({ terminal: Type.Object({ worktreeId: Handle, executi
 const Created = Type.Object({ terminal: Type.Object({ handle: Handle, surface: Type.String() }) });
 const Sent = Type.Object({ send: Type.Object({ accepted: Type.Literal(true) }) });
 const Screen = Type.Object({ terminal: Type.Object({ source: Type.Literal("screen"), tail: Type.Array(Type.String()) }) });
+const Lifecycle = Type.Object({ terminal: Type.Object({
+  exitCause: Type.Optional(Type.Object({ kind: Type.Union([
+    Type.Literal("operator_close"), Type.Literal("exited"), Type.Literal("signaled"), Type.Literal("unknown"),
+  ]) })),
+}) });
 
 /** Target the current Orca runtime: honor `ORCA_CLI_COMMAND`, use `orca-dev` in a development session, and otherwise use `orca`. */
 export function cliCommand(): string {
@@ -42,6 +47,11 @@ function call<T extends TSchema>(args: string[], schema: T): Static<T> {
   return decode(execFileSync(cliCommand(), ["terminal", ...args, "--json"], { encoding: "utf8" }), schema);
 }
 
+async function callAsync<T extends TSchema>(args: string[], schema: T): Promise<Static<T>> {
+  const { stdout } = await execFileAsync(cliCommand(), ["terminal", ...args, "--json"], { encoding: "utf8" });
+  return decode(stdout, schema);
+}
+
 /** Create a visible terminal tab in the caller's local worktree without taking focus. */
 export function createTab(name: string): string {
   const parent = call(["show", "--terminal", currentHandle()], Parent).terminal;
@@ -71,13 +81,19 @@ export function readScreen(handle: string, lines: number): string {
 }
 
 export async function readScreenAsync(handle: string, lines: number): Promise<string> {
-  const { stdout } = await execFileAsync(cliCommand(), [
-    "terminal", "read", "--terminal", handle, "--screen", "--limit", String(lines), "--json",
-  ], { encoding: "utf8" });
-  return decode(stdout, Screen).terminal.tail.join("\n");
+  const result = await callAsync(["read", "--terminal", handle, "--screen", "--limit", String(lines)], Screen);
+  return result.terminal.tail.join("\n");
 }
 
-/** Close the addressed terminal pane while leaving sibling splits in its tab open. */
+/** True only when Orca confirms an operator-requested close; query failures reject. */
+export async function isTabClosed(handle: string): Promise<boolean> {
+  const result = await callAsync(["show", "--terminal", handle], Lifecycle);
+  return result.terminal.exitCause?.kind === "operator_close";
+}
+
+/** Close the addressed pane, leaving sibling splits open; an operator-closed pane needs no further close. */
 export function closeTab(handle: string): void {
+  const result = call(["show", "--terminal", handle], Lifecycle);
+  if (result.terminal.exitCause?.kind === "operator_close") return;
   call(["close", "--terminal", handle], Type.Object({}));
 }

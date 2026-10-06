@@ -5,9 +5,10 @@ import { setTimeout } from "node:timers/promises";
 import { Type } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 import { cliCommand } from "../../pi-extension/subagents/orca.ts";
+import { pollForExit } from "../../pi-extension/subagents/completion.ts";
 import {
   createSurface, sendCommand, sendEscape, readScreenAsync,
-  closeSurface, pollForExit, shellEscape,
+  closeSurface, shellEscape,
 } from "../../pi-extension/subagents/mux.ts";
 
 function activeTabs(): string[] {
