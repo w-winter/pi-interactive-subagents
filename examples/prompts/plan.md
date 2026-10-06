@@ -1,16 +1,21 @@
 ---
-name: plan
-description: >
-  Planning workflow. Runs a pre-flight scout, then spawns the planner agent
-  which clarifies WHAT to build and figures out HOW, with the ability to
-  spawn its own scouts/researchers mid-session. Use when asked to "plan",
-  "brainstorm", "I want to build X", or "let's design". Requires the
-  subagents extension and a supported multiplexer (cmux/tmux/zellij/Orca).
+description: Plan a feature with a scout and interactive planner, then implement and review it
+argument-hint: "<task>"
 ---
 
 # Plan
 
 A planning workflow. A scout maps the relevant codebase, then an interactive planner clarifies intent + requirements and designs the technical approach, producing a `plan.md` and todos.
+
+## User request
+
+$ARGUMENTS
+
+If no request was supplied, ask the user what they want to plan before spawning agents.
+
+## Prerequisites
+
+This workflow requires Pi Interactive Subagents, a supported multiplexer, the `todo` tool, and installed agent definitions named `scout`, `planner`, `worker`, and `reviewer`. Edit the agent names to use your own roles. A `researcher` definition is needed only if the planner delegates external research. If a required tool or definition is unavailable, ask the user to configure it before proceeding.
 
 **Announce at start:** "Let me take a quick look, then I'll send a scout to map the codebase before we start the planning session."
 
@@ -198,6 +203,6 @@ Before reporting done:
 1. ✅ Scout ran before the planner?
 2. ✅ Scout context was passed to the planner?
 3. ✅ All worker todos closed?
-4. ✅ Every todo has a polished commit (using the `commit` skill)?
+4. ✅ Every todo has a commit authorized by the user?
 5. ✅ Reviewer has run?
 6. ✅ Reviewer findings triaged and addressed?

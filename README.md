@@ -253,40 +253,28 @@ await caller_ping({
 
 ---
 
-## The `/plan` Workflow
+## Optional workflow prompts
 
-The `/plan` command orchestrates a full planning-to-implementation pipeline.
+The Markdown templates in [`examples/prompts/`](examples/prompts/) provide planning and focused-work workflows. Install the ones you want, then edit their instructions and names. From the extension checkout, install them for use across projects:
 
+```bash
+prompt_dir="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/prompts"
+mkdir -p "$prompt_dir"
+cp -i examples/prompts/plan.md examples/prompts/iterate.md "$prompt_dir/"
 ```
+
+For one project, copy the selected files into that project's `.pi/prompts/` directory instead. Run `/reload` in an active Pi session after installing or editing templates. Project templates load after you trust the project in Pi.
+
+```text
 /plan Add a dark mode toggle to the settings page
-```
-
-```
-Phase 1: Investigation    → Quick codebase scan
-Phase 2: Planning         → Interactive planner subagent (user collaborates)
-Phase 3: Review Plan      → Confirm todos, adjust if needed
-Phase 4: Execute          → Scout + sequential workers implement todos
-Phase 5: Review           → Reviewer subagent checks all changes
-```
-
-Tab/window titles update to show current phase:
-
-```
-🔍 Investigating: dark mode → 💬 Planning: dark mode
-→ 🔨 Executing: 1/3 → 🔎 Reviewing → ✅ Done
-```
-
----
-
-## The `/iterate` Workflow
-
-For quick, focused work without polluting the main session's context.
-
-```
 /iterate Fix the off-by-one error in the pagination logic
 ```
 
-This always forks the current session into a subagent with full conversation context. It does not inherit an agent default `session-mode`. Make the fix, verify it, and exit to return. The main session gets a summary of what was done.
+The planning example uses `scout`, `planner`, `worker`, and `reviewer` definitions and the `todo` tool. Install those roles or edit the names to match your definitions. The planner can also use a `researcher` role for external research. It gathers context, creates a plan with the user, then coordinates implementation and review.
+
+The `iterate.md` template sets `fork: true` to give the child the current conversation and leaves it open for user interaction. Its task argument is optional. Close the child or call `subagent_done` when you want to return its results to the parent.
+
+The filename defines the command name: copy `iterate.md` as `focus.md` to invoke it with `/focus`. Remove an installed file and run `/reload` to remove that command. You can also write your own `plan.md` or `iterate.md`.
 
 ---
 
@@ -344,7 +332,7 @@ Choose how a subagent session starts:
 
 `lineage-only` is useful when you want session discovery and fork lineage UX to show the relationship later, but you do **not** want the child to inherit the parent's turns.
 
-`fork: true` on the tool call always forces the `fork` mode for that specific spawn. `/iterate` uses this explicit override on purpose.
+`fork: true` on the tool call always forces the `fork` mode for that specific spawn. The optional iterate template uses this override.
 
 ```yaml
 ---

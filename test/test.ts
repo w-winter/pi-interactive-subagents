@@ -1576,19 +1576,11 @@ describe("mux.ts interpretExitSidecar", () => {
   });
 });
 describe("commands", () => {
-  it("/iterate always emits a full-context fork tool call", () => {
-    const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
-
+  it("leaves plan and iterate names available for user prompt templates", () => {
+    const { api, registeredCommands } = createMockExtensionApi();
     (subagentsModule as any).default(api);
-
-    const iterate = registeredCommands.find((command) => command.name === "iterate");
-    assert.ok(iterate, "expected /iterate to be registered");
-
-    iterate.handler("Fix the bug", {});
-
-    assert.equal(sentUserMessages.length, 1);
-    assert.match(sentUserMessages[0], /fork: true/);
-    assert.match(sentUserMessages[0], /name: "Iterate"/);
+    assert.ok(registeredCommands.some((command) => command.name === "subagent"));
+    assert.equal(registeredCommands.some((command) => command.name === "plan" || command.name === "iterate"), false);
   });
 });
 
