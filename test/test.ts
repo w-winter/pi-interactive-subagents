@@ -997,24 +997,19 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled scout/worker/reviewer agents resolve as non-interactive; planner resolves as interactive", () => {
-    for (const name of ["scout", "worker", "reviewer"]) {
-      const defs = testApi.loadAgentDefaults(name);
-      assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
-      assert.equal(
-        testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
-        false,
-        `${name} should resolve as non-interactive (autonomous)`,
-      );
-    }
-
-    const planner = testApi.loadAgentDefaults("planner");
-    assert.ok(planner, "expected bundled planner to be discoverable");
-    assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "planner", task: "" }, planner),
-      true,
-      "planner should resolve as interactive (no auto-exit)",
-    );
+  it("derives interactive behavior from isolated agent definitions", async () => {
+    await withIsolatedAgentEnv(({ projectAgentsDir }) => {
+      const fixtures = [
+        { name: "autonomous-fixture", frontmatter: "auto-exit: true", interactive: false },
+        { name: "interactive-fixture", frontmatter: "description: Waits for input", interactive: true },
+      ];
+      for (const { name, frontmatter, interactive } of fixtures) {
+        writeAgentFile(projectAgentsDir, name, frontmatter);
+        const defs = testApi.loadAgentDefaults(name);
+        assert.ok(defs, `expected fixture ${name} to load`);
+        assert.equal(testApi.resolveEffectiveInteractive({ name, task: "" }, defs), interactive);
+      }
+    });
   });
 
   it("ignores invalid session-mode values", async () => {
