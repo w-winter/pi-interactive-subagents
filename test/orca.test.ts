@@ -219,6 +219,7 @@ describe("Orca backend", () => {
     t.after(() => shutdown());
     process.env.ORCA_TEST_SCENARIO = "closed-unreadable";
     process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+    process.env.PI_SUBAGENT_AUTO_EXIT = "1";
     process.env.PI_CODING_AGENT_DIR = join(directory, "agent");
     const agentDir = join(process.env.PI_CODING_AGENT_DIR, "agents");
     mkdirSync(agentDir, { recursive: true });
@@ -270,11 +271,17 @@ describe("Orca backend", () => {
       assert.ok(tool);
       await tool.execute("launch", entry.params, undefined, undefined, ctx);
       const message = await completed;
-      if (entry.params.name === "Selected model child") {
+      if (entry.params.name !== "Claude child") {
         const scriptDir = join(directory, "artifacts", "lifecycle-test", "subagent-scripts");
-        const script = readdirSync(scriptDir).find((name) => name.startsWith("selected-model-child-"));
+        const prefix = entry.params.name.toLowerCase().replaceAll(" ", "-") + "-";
+        const script = readdirSync(scriptDir).find((name) => name.startsWith(prefix));
         assert.ok(script);
-        assert.match(readFileSync(join(scriptDir, script), "utf8"), /'--model' 'fixture\/selected-model'/);
+        const command = readFileSync(join(scriptDir, script), "utf8");
+        const autoExit = entry.params.name === "Selected model child" ? "1" : "0";
+        assert.ok(command.includes(`PI_SUBAGENT_AUTO_EXIT=${autoExit}`));
+        if (entry.params.name === "Selected model child") {
+          assert.match(command, /'--model' 'fixture\/selected-model'/);
+        }
       }
       if (entry.params.name === "Fresh child" || entry.params.name === "Interactive child") {
         const contextDir = join(directory, "artifacts", "lifecycle-test", "context");
