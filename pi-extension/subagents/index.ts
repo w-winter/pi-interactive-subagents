@@ -14,7 +14,7 @@ import {
   unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { buildModelArgs, conversationArgs, readConversationProfile, type ConversationProfile } from "./conversation-profile.ts";
+import { buildModelArgs, buildResumeArgs, conversationArgs, readConversationProfile, type ConversationProfile } from "./conversation-profile.ts";
 import {
   isMuxAvailable,
   muxSetupHint,
@@ -100,6 +100,7 @@ const SubagentParams = Type.Object({
     Type.String({ description: "Appended to system prompt (role instructions)" }),
   ),
   model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
+  thinking: Type.Optional(Type.String({ description: "Thinking level override (overrides agent default, including off)" })),
   skills: Type.Optional(
     Type.String({ description: "Comma-separated skills (overrides agent default)" }),
   ),
@@ -978,7 +979,7 @@ async function launchSubagent(
   const effectiveModel = params.model ?? agentDefs?.model;
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
-  const effectiveThinking = agentDefs?.thinking;
+  const effectiveThinking = params.thinking ?? agentDefs?.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
   const isConversation = agentDefs?.profile === "conversation";
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
@@ -1872,7 +1873,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Load subagent-done extension so the agent can self-terminate if needed
         const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
         parts.push("-e", shellEscape(subagentDonePath));
-        if (conversationProfile) parts.push(...conversationArgs(conversationProfile).map(shellEscape));
+        parts.push(...buildResumeArgs(params.sessionPath, conversationProfile).map(shellEscape));
 
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);

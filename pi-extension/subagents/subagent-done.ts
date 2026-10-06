@@ -9,6 +9,7 @@ import { Type } from "@sinclair/typebox";
 import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
 import { parseConversationProfile } from "./conversation-profile.ts";
+import { installSubagentModelGuard } from "./model-guard.ts";
 
 // Auto-exit requires Pi's agent_settled event, absent from the pinned SDK typings.
 type SubagentExtensionAPI = Pick<ExtensionAPI, "on" | "registerTool" | "registerShortcut" | "getAllTools" | "appendEntry"> & {
@@ -105,6 +106,8 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
 }
 
 export default function (pi: SubagentExtensionAPI) {
+  if (process.env.PI_SUBAGENT_SESSION) installSubagentModelGuard();
+
   let toolNames: string[] = [];
   let denied: string[] = [];
   let expanded = false;

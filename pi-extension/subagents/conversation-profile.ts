@@ -1,4 +1,5 @@
 import { isAbsolute } from "node:path";
+import { SessionManager } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 
@@ -45,4 +46,13 @@ export function conversationArgs(profile: ConversationProfile): string[] {
     "--system-prompt", profile.systemPromptPath, "--append-system-prompt", "",
     ...buildModelArgs(profile.model, profile.thinking ?? undefined),
   ];
+}
+
+export function buildResumeArgs(sessionFile: string, profile: ConversationProfile | null): string[] {
+  const branch = SessionManager.open(sessionFile).getBranch();
+  const model = branch.findLast((entry) => entry.type === "model_change");
+  const thinking = branch.findLast((entry) => entry.type === "thinking_level_change");
+  if (!model || !thinking) throw new Error("Cannot resume a subagent without a recorded model and thinking selection");
+  const selection = { model: `${model.provider}/${model.modelId}`, thinking: thinking.thinkingLevel };
+  return profile ? conversationArgs({ ...profile, ...selection }) : buildModelArgs(selection.model, selection.thinking);
 }

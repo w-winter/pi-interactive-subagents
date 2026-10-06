@@ -183,10 +183,21 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
 | `model`                | string  | —              | Override agent's default model                                                                    |
+| `thinking`             | string  | omitted        | Override agent's default thinking level, including `off` |
 | `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |
 | `cwd`                  | string  | —              | Working directory for the sub-agent (see [Role Folders](#role-folders))                           |
+
+### Model and thinking selection
+
+Agent definitions supply the initial model and thinking level. Tool arguments override these defaults. Pi resolves the model reference and clamps thinking to the model's supported levels.
+
+The child treats its current selection as authoritative. Conflicting calls to Pi's extension model and thinking setters raise an error and record a `subagent-selection-rejected` entry in the session. Manual changes through `/model`, `/thinking`, and the native cycling shortcuts update the selection. Resuming a child restores its latest recorded selection.
+
+The guard applies to Pi's extension setter API. Extensions execute inside the Pi process with its operating-system permissions.
+
+Run `npm run test:model-guard` to test the installed Pi at `/opt/homebrew/bin/pi` with a local fake provider. The test checks startup, model requests, manual changes, reload, and resume. It writes a receipt and session transcript to `test/artifacts/model-guard/`.
 
 ---
 
