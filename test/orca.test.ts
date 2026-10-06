@@ -1,6 +1,6 @@
 import { after, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -222,6 +222,7 @@ describe("Orca backend", () => {
     const agentDir = join(process.env.PI_CODING_AGENT_DIR, "agents");
     mkdirSync(agentDir, { recursive: true });
     writeFileSync(join(agentDir, "lifecycle-claude.md"), "---\ncli: claude\n---\nTest agent.\n");
+    writeFileSync(join(agentDir, "lifecycle-interactive.md"), "---\nsystem-prompt: replace\n---\nWait for the user's next request.\n");
     const sessionFile = join(directory, "parent.jsonl");
     writeFileSync(sessionFile, [
       { type: "session", version: 3, id: "lifecycle-test", cwd: directory },
@@ -240,6 +241,7 @@ describe("Orca backend", () => {
     const ctx = context as Parameters<Tool["execute"]>[4];
     const cases = [
       { tool: "subagent", params: { name: "Fresh child", task: "Wait", cwd: directory } },
+      { tool: "subagent", params: { name: "Interactive child", task: "Wait", agent: "lifecycle-interactive", cwd: directory } },
       { tool: "subagent_resume", params: { name: "Resumed child", sessionPath: sessionFile, autoExit: false } },
       { tool: "subagent", params: { name: "Claude child", task: "Wait", agent: "lifecycle-claude", cwd: directory } },
     ];
@@ -250,6 +252,21 @@ describe("Orca backend", () => {
       assert.ok(tool);
       await tool.execute("launch", entry.params, undefined, undefined, ctx);
       const message = await completed;
+      if (entry.params.name === "Fresh child" || entry.params.name === "Interactive child") {
+        const contextDir = join(directory, "artifacts", "lifecycle-test", "context");
+        const taskFiles = readdirSync(contextDir).filter((name) => !name.includes("sysprompt"));
+        assert.ok(taskFiles.length > 0);
+        for (const file of taskFiles) {
+          const task = readFileSync(join(contextDir, file), "utf8");
+          assert.match(task, /Wait/);
+          assert.doesNotMatch(task, /call(?:ing)? (?:the )?subagent_done|Complete your task/);
+        }
+        if (entry.params.name === "Interactive child") {
+          const systemPrompt = readdirSync(contextDir).find((name) => name.includes("sysprompt"));
+          assert.ok(systemPrompt);
+          assert.equal(readFileSync(join(contextDir, systemPrompt), "utf8"), "Wait for the user's next request.");
+        }
+      }
       assert.equal(message.customType, "subagent_result");
       assert.match(JSON.stringify(message.content), /closed by user/);
       const interrupt = tools.get("subagent_interrupt");

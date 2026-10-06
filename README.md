@@ -376,6 +376,8 @@ Pass source documents using `inputFiles`, not paths that the model would need a 
 
 ### `auto-exit`
 
+Pi-backed children stay open after a response when `auto-exit` is false or omitted. Write role and completion instructions in the body of your agent definition or the task you pass to `subagent`. You can continue the conversation in the child's pane, use `subagent_done` to return its results, or close the session manually.
+
 When set to `true`, the agent session shuts down automatically after Pi finishes the run, including automatic recovery and queued work. Auto-exit requires a Pi runtime that emits `agent_settled`.
 
 **Behavior:**
@@ -383,7 +385,6 @@ When set to `true`, the agent session shuts down automatically after Pi finishes
 - The session closes on `agent_settled`, after the final response
 - Provider failures and output-token-limit truncation are reported to the parent as errors; partial responses remain in the session transcript
 - Interrupting a turn leaves the session open for inspection or resumption; a later completed turn can still auto-exit
-- The modeHint injected into the agent's task is adjusted accordingly: autonomous agents see "Complete your task autonomously." rather than instructions to call `subagent_done`
 
 **When to use:**
 

@@ -1030,15 +1030,8 @@ async function launchSubagent(
   mkdirSync(dirname(activityFile), { recursive: true });
   const { inheritsConversationContext } = launchBehavior;
 
-  // Build the task message
-  // Only full-context fork mode inherits prior conversation state.
-  // Blank-session modes need the wrapper instructions and artifact-backed handoff.
-  const modeHint = agentDefs?.autoExit
-    ? "Complete your task autonomously."
-    : "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
-  const summaryInstruction = agentDefs?.autoExit
-    ? "Your FINAL assistant message must provide the deliverable requested by your task, in its requested format."
-    : "Your FINAL assistant message (before calling subagent_done or before the user exits) must provide the deliverable requested by your task, in its requested format.";
+  const summaryInstruction =
+    "Your FINAL assistant message must provide the deliverable requested by your task, in its requested format.";
   const denySet = resolveDenyTools(agentDefs);
   const identity = agentDefs?.body ?? params.systemPrompt ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
@@ -1046,7 +1039,7 @@ async function launchSubagent(
   const roleBlock = identity && !identityInSystemPrompt ? `\n\n${identity}` : "";
   const fullTask = inheritsConversationContext || isConversation
     ? params.task
-    : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
+    : `${roleBlock}\n\n${params.task}\n\n${summaryInstruction}`;
   // ── Claude Code CLI path ──
   if (agentDefs?.cli === "claude") {
     const sentinelFile = `/tmp/pi-claude-${id}-done`;
