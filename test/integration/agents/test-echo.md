@@ -1,4 +1,5 @@
 ---
+extension: pi-interactive-subagents
 name: test-echo
 description: Integration test agent — completes simple file-writing tasks
 tools: read, bash, write, edit

@@ -1,4 +1,5 @@
 ---
+extension: pi-interactive-subagents
 name: test-ping
 description: Integration test agent — calls caller_ping instead of completing task
 tools: read, bash

@@ -1,4 +1,5 @@
 ---
+extension: pi-interactive-subagents
 name: scout
 description: Fast codebase reconnaissance - maps existing code, conventions, and patterns for a task
 tools: read, bash

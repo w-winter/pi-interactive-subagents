@@ -84,7 +84,17 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch 
 | `/iterate`                 | Fork into a subagent for quick fixes |
 | `/subagent <agent> <task>` | Spawn a named agent directly         |
 
-### Bundled Agents
+### Example agents
+
+[`examples/agents/`](examples/agents/) contains starting points for your own roles. Choose the examples you want, install them in an active agent directory, then edit those copies. From the extension checkout, install the scout globally:
+
+```bash
+agent_dir="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/agents"
+mkdir -p "$agent_dir"
+cp -i examples/agents/scout.md "$agent_dir/"
+```
+
+For one project, copy the selected files into its `.pi/agents/` directory instead. Definitions are read each time you list, complete, or launch an agent, so installing or editing them takes effect immediately.
 
 | Agent             | Model                  | Role                                                                                     |
 | ----------------- | ---------------------- | ---------------------------------------------------------------------------------------- |
@@ -94,7 +104,7 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch 
 | **reviewer**      | Opus (medium thinking) | Reviews code for bugs, security issues, correctness                                      |
 | **visual-tester** | Sonnet                 | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
 
-Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Override any bundled agent by placing your own version in the higher-priority location.
+Configure access to each example's model or edit its `model` field. The planner expects `scout` and optionally `researcher` roles, the `todo` tool, a `write-todos` skill, and an `/answer` command. The worker expects `todo` and a `commit` skill. Supply those resources through your Pi configuration or adapt the copied instructions to your tools. The visual tester needs the `chrome-cdp` skill, its `scripts/cdp.mjs` executable, Chrome with remote debugging enabled, and the target page open in a tab. Run `npm run test:agent-examples` to check installation of the shipped definitions independently of the core tests.
 
 ---
 
@@ -163,7 +173,7 @@ cp config.json.example config.json
 ## Spawning Subagents
 
 ```typescript
-// Named agent with defaults from agent definition
+// After installing the named agent definitions
 subagent({ name: "Scout", agent: "scout", task: "Analyze the codebase..." });
 
 // Force a full-context fork for this spawn
@@ -183,7 +193,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `name`                 | string  | required       | Display name (shown in widget and pane title)                                                     |
 | `task`                 | string  | required       | Task prompt for the sub-agent                                                                     |
 | `inputFiles`           | string[] | omitted       | Absolute file paths attached to the initial prompt through Pi's `@file` handling |
-| `agent`                | string  | —              | Load defaults from agent definition                                                               |
+| `agent`                | string  | —              | Exact canonical name of an installed marked definition; omit for a bare launch |
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
 | `model`                | string  | —              | Override agent's default model                                                                    |
@@ -280,7 +290,7 @@ For one project, copy the selected files into that project's `.pi/prompts/` dire
 /iterate Fix the off-by-one error in the pagination logic
 ```
 
-The planning example uses `scout`, `planner`, `worker`, and `reviewer` definitions and the `todo` tool. Install those roles or edit the names to match your definitions. The planner can also use a `researcher` role for external research. It gathers context, creates a plan with the user, then coordinates implementation and review.
+The planning example uses marked, user-installed `scout`, `planner`, `worker`, and `reviewer` definitions and the `todo` tool. Install those roles or edit the names to match your definitions. The planner can also use a `researcher` role for external research. It gathers context, creates a plan with the user, then coordinates implementation and review.
 
 The `iterate.md` template sets `fork: true` to give the child the current conversation and leaves it open for user interaction. Its task argument is optional. Close the child or call `subagent_done` when you want to return its results to the parent.
 
@@ -290,10 +300,11 @@ The filename defines the command name: copy `iterate.md` as `focus.md` to invoke
 
 ## Custom Agents
 
-Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global):
+Place a `.md` file in `.pi/agents/` under the current working directory (project) or `<agent-dir>/agents/` (global). The global root is `PI_CODING_AGENT_DIR`, defaulting to `~/.pi/agent`. Add the exact scalar frontmatter value `extension: pi-interactive-subagents` to each definition you want Pi Interactive Subagents (PIS) to use. Valid files with another value or no marker belong outside PIS discovery; other extensions can share these directories and apply their own rules.
 
 ```markdown
 ---
+extension: pi-interactive-subagents
 name: my-agent
 description: Does something specific
 model: anthropic/claude-sonnet-4-6
@@ -308,11 +319,20 @@ spawning: false
 You are a specialized agent that does X...
 ```
 
+The canonical agent name is the frontmatter `name`, or the filename without `.md` when `name` is omitted. Names are nonempty tokens with no whitespace. Invocation uses the exact name, including case; completion matches prefixes case-insensitively. A file named `role.md` with `name: my-agent` is invoked as `my-agent`.
+
+A marked project definition replaces the entire global definition with the same canonical name. Duplicate names within one directory are errors. Add the marker and move any definitions you keep in the extension's `agents/` directory into an active directory to use them.
+
+Malformed frontmatter, invalid marked fields, and unreadable definitions stop listing, completion, and named launches across both directories. Submission errors identify the file to correct; unavailable names report the searched directories. This includes malformed files belonging to other extensions because their marker cannot be parsed. Correct the file and repeat the operation. An unavailable explicit name, including an empty string, fails before a child is created; omit `agent` to launch a bare child.
+
 ### Frontmatter Reference
+
+Use YAML scalar values for the fields below. Null values, arrays, and mappings produce errors in marked definitions. Leave optional fields out to use launch defaults, and quote strings containing YAML punctuation, such as `model: "provider/model # literal"`.
 
 | Field         | Type    | Description                                                                                                                                                                                                                                                                 |
 | ------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`        | string  | Agent name (used in `agent: "my-agent"`)                                                                                                                                                                                                                                    |
+| `extension` | string | Required exact value: `pi-interactive-subagents` |
+| `name` | scalar | Canonical invocation name; defaults to the filename stem |
 | `description` | string  | Shown in `subagents_list` output                                                                                                                                                                                                                                            |
 | `model`       | string  | Default model (e.g. `anthropic/claude-sonnet-4-6`)                                                                                                                                                                                                                          |
 | `thinking`    | string  | Explicit thinking level, including `off`; passed through `--thinking` so it overrides a model suffix |
@@ -330,7 +350,7 @@ You are a specialized agent that does X...
 
 ---
 
-Discovery still resolves precedence before visibility filtering. If a project-local hidden agent has the same name as a visible global or bundled agent, the hidden project agent wins and the lower-precedence agent does not appear in `subagents_list`.
+Discovery resolves precedence before visibility filtering. If a hidden project agent has the same canonical name as a visible global agent, the hidden project agent wins. It remains available through manual completion and explicit invocation.
 
 ### `session-mode`
 

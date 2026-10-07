@@ -6,7 +6,6 @@ import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  readdirSync,
   readFileSync,
   writeFileSync,
   existsSync,
@@ -16,6 +15,14 @@ import {
   realpathSync,
 } from "node:fs";
 import { homedir } from "node:os";
+import {
+  AgentDefinitionError,
+  discoverAgentDefinitions as discoverActiveAgentDefinitions,
+  loadAgentDefaults as loadActiveAgentDefaults,
+  type AgentDefaults,
+  type ListedAgentDefinition,
+  type SubagentSessionMode,
+} from "./agent-definitions.ts";
 import { buildModelArgs, buildResumeArgs, conversationArgs, readConversationProfile, type ConversationProfile } from "./conversation-profile.ts";
 import { pollForExit, type PollResult } from "./completion.ts";
 import {
@@ -87,7 +94,7 @@ const SubagentParams = Type.Object({
   agent: Type.Optional(
     Type.String({
       description:
-        "Agent name to load defaults from (e.g. 'worker', 'scout', 'reviewer'). Reads ~/.pi/agent/agents/<name>.md for model, tools, skills.",
+        "Exact canonical name of a definition marked extension: pi-interactive-subagents in .pi/agents/ or the global agent directory. Unavailable names fail before launch. Omit agent for a bare launch.",
     }),
   ),
   systemPrompt: Type.Optional(
@@ -126,38 +133,6 @@ const SubagentParams = Type.Object({
     }),
   ),
 });
-
-type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
-
-interface AgentDefaults {
-  profile?: "conversation";
-  model?: string;
-  tools?: string;
-  skills?: string;
-  thinking?: string;
-  denyTools?: string;
-  spawning?: boolean;
-  autoExit?: boolean;
-  interactive?: boolean;
-  systemPromptMode?: "append" | "replace";
-  sessionMode?: SubagentSessionMode;
-  cwd?: string;
-  cli?: string;
-  body?: string;
-  disableModelInvocation?: boolean;
-}
-
-type AgentSource = "package" | "global" | "project";
-
-interface AgentDefinition extends AgentDefaults {
-  name: string;
-  description?: string;
-  disableModelInvocation: boolean;
-}
-
-interface ListedAgentDefinition extends AgentDefinition {
-  source: AgentSource;
-}
 
 /** Tools that are gated by `spawning: false` */
 const SPAWNING_TOOLS = new Set([
@@ -199,87 +174,12 @@ function getAgentConfigDir(): string {
   return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 }
 
-function getBundledAgentsDir(): string {
-  return join(SUBAGENTS_DIR, "../../agents");
-}
-
-function getFrontmatterValue(frontmatter: string, key: string): string | undefined {
-  const match = frontmatter.match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
-  return match ? match[1].trim() : undefined;
-}
-
-function parseOptionalBoolean(value: string | undefined): boolean | undefined {
-  return value != null ? value === "true" : undefined;
-}
-
-function parseSessionMode(value: string | undefined): SubagentSessionMode | undefined {
-  if (value === "standalone" || value === "lineage-only" || value === "fork") {
-    return value;
-  }
-  return undefined;
-}
-
-function parseAgentDefinition(content: string, fallbackName: string): AgentDefinition | null {
-  const match = content.match(/^---\n([\s\S]*?)\n---/);
-  if (!match) return null;
-
-  const frontmatter = match[1];
-  const body = content.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
-  const systemPromptMode = getFrontmatterValue(frontmatter, "system-prompt");
-  const profile = getFrontmatterValue(frontmatter, "profile");
-  if (profile !== undefined && profile !== "conversation") throw new Error(`Unsupported agent profile: ${profile}`);
-  if (profile === "conversation" && (systemPromptMode !== "replace" || !body)) {
-    throw new Error("Conversation agents require system-prompt: replace and a nonempty prompt body");
-  }
-
-  return {
-    profile,
-    name: getFrontmatterValue(frontmatter, "name") ?? fallbackName,
-    description: getFrontmatterValue(frontmatter, "description"),
-    model: getFrontmatterValue(frontmatter, "model"),
-    tools: getFrontmatterValue(frontmatter, "tools"),
-    systemPromptMode:
-      systemPromptMode === "replace"
-        ? "replace"
-        : systemPromptMode === "append"
-          ? "append"
-          : undefined,
-    skills: getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills"),
-    thinking: getFrontmatterValue(frontmatter, "thinking"),
-    denyTools: getFrontmatterValue(frontmatter, "deny-tools"),
-    spawning: parseOptionalBoolean(getFrontmatterValue(frontmatter, "spawning")),
-    autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
-    interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
-    sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
-    cwd: getFrontmatterValue(frontmatter, "cwd"),
-    cli: getFrontmatterValue(frontmatter, "cli"),
-    body: body || undefined,
-    disableModelInvocation:
-      getFrontmatterValue(frontmatter, "disable-model-invocation")?.toLowerCase() === "true",
-  };
-}
-
 function discoverAgentDefinitions(): ListedAgentDefinition[] {
-  const agents = new Map<string, ListedAgentDefinition>();
-  const dirs: Array<{ path: string; source: AgentSource }> = [
-    { path: getBundledAgentsDir(), source: "package" },
-    { path: join(getAgentConfigDir(), "agents"), source: "global" },
-    { path: join(process.cwd(), ".pi", "agents"), source: "project" },
-  ];
+  return discoverActiveAgentDefinitions(getAgentConfigDir(), process.cwd());
+}
 
-  for (const { path: dir, source } of dirs) {
-    if (!existsSync(dir)) continue;
-    for (const file of readdirSync(dir).filter((entry) => entry.endsWith(".md"))) {
-      const parsed = parseAgentDefinition(
-        readFileSync(join(dir, file), "utf8"),
-        file.replace(/\.md$/, ""),
-      );
-      if (!parsed) continue;
-      agents.set(parsed.name, { ...parsed, source });
-    }
-  }
-
-  return [...agents.values()];
+function logAgentDefinitionError(operation: string, error: AgentDefinitionError): void {
+  console.warn("[subagents:agent-definitions]", JSON.stringify({ operation, diagnostic: error.message }));
 }
 
 function resolveSubagentPaths(
@@ -361,21 +261,8 @@ function resolveEffectiveInteractive(
   return !(agentDefs?.autoExit ?? false);
 }
 
-function loadAgentDefaults(agentName: string): AgentDefaults | null {
-  const configDir = getAgentConfigDir();
-  const paths = [
-    join(process.cwd(), ".pi", "agents", `${agentName}.md`),
-    join(configDir, "agents", `${agentName}.md`),
-    join(getBundledAgentsDir(), `${agentName}.md`),
-  ];
-
-  for (const p of paths) {
-    if (!existsSync(p)) continue;
-    const parsed = parseAgentDefinition(readFileSync(p, "utf8"), agentName);
-    if (parsed) return parsed;
-  }
-
-  return null;
+function loadAgentDefaults(agentName: string): ListedAgentDefinition {
+  return loadActiveAgentDefaults(agentName, getAgentConfigDir(), process.cwd());
 }
 
 function formatElapsed(seconds: number): string {
@@ -978,7 +865,7 @@ async function launchSubagent(
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
-  const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+  const agentDefs = params.agent === undefined ? null : loadAgentDefaults(params.agent);
   const effectiveModel = params.model ?? agentDefs?.model;
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
@@ -1576,7 +1463,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Launch the subagent (creates pane, sends command)
-        const running = await launchSubagent(params, ctx);
+        let running: RunningSubagent;
+        try {
+          running = await launchSubagent(params, ctx);
+        } catch (error) {
+          if (error instanceof AgentDefinitionError) logAgentDefinitionError("subagent", error);
+          throw error;
+        }
 
         startWidgetRefresh();
         startStatusRefresh(pi);
@@ -1641,7 +1534,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return new Text(text, 0, 0);
       },
 
-      renderResult(result, _opts, theme) {
+      renderResult(result, _opts, theme, context) {
+        if (context.isError) {
+          return new Text(result.content.filter((block) => block.type === "text").map((block) => block.text).join("\n"), 0, 0);
+        }
         const details = result.details as any;
         const name = details?.name ?? "(unnamed)";
 
@@ -1721,21 +1617,25 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagents_list",
       label: "List Subagents",
       description:
-        "List all available subagent definitions. " +
-        "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-        "Project-local agents override global ones with the same name.",
+        "List definitions marked extension: pi-interactive-subagents in .pi/agents/ and <agent-dir>/agents/. " +
+        "The global agent directory honors PI_CODING_AGENT_DIR (default ~/.pi/agent). " +
+        "Project definitions replace global definitions with the same canonical name.",
       promptSnippet:
-        "List all available subagent definitions. " +
-        "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-        "Project-local agents override global ones with the same name.",
+        "List marked pi-interactive-subagents definitions from project and global agent directories.",
       parameters: Type.Object({}),
 
       async execute() {
-        const list = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
+        let list: ListedAgentDefinition[];
+        try {
+          list = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
+        } catch (error) {
+          if (error instanceof AgentDefinitionError) logAgentDefinitionError("subagents_list", error);
+          throw error;
+        }
 
         if (list.length === 0) {
           return {
-            content: [{ type: "text", text: "No subagent definitions found." }],
+            content: [{ type: "text", text: `No subagent definitions found. Add extension: pi-interactive-subagents to definitions in ${join(getAgentConfigDir(), "agents")} or ${join(process.cwd(), ".pi", "agents")}.` }],
             details: { agents: [] },
           };
         }
@@ -1753,7 +1653,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         };
       },
 
-      renderResult(result, _opts, theme) {
+      renderResult(result, _opts, theme, context) {
+        if (context.isError) {
+          return new Text(result.content.filter((block) => block.type === "text").map((block) => block.text).join("\n"), 0, 0);
+        }
         const details = result.details as any;
         const agents = details?.agents ?? [];
         if (agents.length === 0) {
@@ -2006,10 +1909,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     getArgumentCompletions: (argumentPrefix) => {
       const prefix = argumentPrefix.trimStart();
       if (/\s/.test(prefix)) return null;
-      const matches = discoverAgentDefinitions()
-        .filter((agent) => agent.name.toLowerCase().startsWith(prefix.toLowerCase()))
-        .map((agent) => ({ value: agent.name, label: agent.name, description: agent.description }));
-      return matches.length > 0 ? matches : null;
+      try {
+        const matches = discoverAgentDefinitions()
+          .filter((agent) => agent.name.toLowerCase().startsWith(prefix.toLowerCase()))
+          .map((agent) => ({ value: agent.name, label: agent.name, description: agent.description }));
+        return matches.length > 0 ? matches : null;
+      } catch (error) {
+        if (!(error instanceof AgentDefinitionError)) throw error;
+        logAgentDefinitionError("subagent-completion", error);
+        return null;
+      }
     },
     handler: async (args, ctx) => {
       const trimmed = args.trim();
@@ -2018,22 +1927,22 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return;
       }
 
-      const spaceIdx = trimmed.indexOf(" ");
+      const spaceIdx = trimmed.search(/\s/);
       const agentName = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
       const task = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
 
-      const defs = loadAgentDefaults(agentName);
-      if (!defs) {
-        ctx.ui.notify(
-          `Agent "${agentName}" not found in ~/.pi/agent/agents/ or .pi/agents/`,
-          "error",
-        );
+      try {
+        loadAgentDefaults(agentName);
+      } catch (error) {
+        if (!(error instanceof AgentDefinitionError)) throw error;
+        logAgentDefinitionError("subagent-command", error);
+        ctx.ui.notify(error.message, "error");
         return;
       }
 
       const taskText = task || `You are the ${agentName} agent. Wait for instructions.`;
       const displayName = agentName[0].toUpperCase() + agentName.slice(1);
-      const toolCall = `Use subagent with agent: "${agentName}", name: "${displayName}", task: ${JSON.stringify(taskText)}`;
+      const toolCall = `Use subagent with agent: ${JSON.stringify(agentName)}, name: ${JSON.stringify(displayName)}, task: ${JSON.stringify(taskText)}`;
       pi.sendUserMessage(toolCall);
     },
   });

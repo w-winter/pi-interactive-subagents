@@ -1,4 +1,5 @@
 ---
+extension: pi-interactive-subagents
 name: reviewer
 description: Code review agent - reviews changes for quality, security, and correctness
 tools: read, bash

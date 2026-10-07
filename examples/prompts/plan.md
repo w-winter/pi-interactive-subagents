@@ -15,7 +15,7 @@ If no request was supplied, ask the user what they want to plan before spawning 
 
 ## Prerequisites
 
-This workflow requires Pi Interactive Subagents, a supported multiplexer, the `todo` tool, and installed agent definitions named `scout`, `planner`, `worker`, and `reviewer`. Edit the agent names to use your own roles. A `researcher` definition is needed only if the planner delegates external research. If a required tool or definition is unavailable, ask the user to configure it before proceeding.
+This workflow requires Pi Interactive Subagents, a supported multiplexer, the `todo` tool, and agent definitions named `scout`, `planner`, `worker`, and `reviewer` installed in `<agent-dir>/agents/` or the current project's `.pi/agents/`. Each definition must include `extension: pi-interactive-subagents` in its frontmatter. The global agent root is `PI_CODING_AGENT_DIR`, defaulting to `~/.pi/agent`. Edit the agent names to use your own roles. A `researcher` definition is needed only if the planner delegates external research. If a required tool or definition is unavailable, ask the user to configure it before proceeding.
 
 **Announce at start:** "Let me take a quick look, then I'll send a scout to map the codebase before we start the planning session."
 

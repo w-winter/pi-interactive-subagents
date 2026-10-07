@@ -208,7 +208,7 @@ export function createTestEnv(backend: MuxBackend, model = TEST_MODEL): TestEnv 
     for (const file of readdirSync(TEST_AGENTS_SRC)) {
       if (file.endsWith(".md")) {
         const content = readFileSync(join(TEST_AGENTS_SRC, file), "utf8");
-        writeFileSync(join(agentsDir, file), content.replace(/^---\n/, `---\nmodel: ${model}\n`));
+        writeFileSync(join(agentsDir, file), content.replace(/^---\n/, `---\nmodel: ${JSON.stringify(model)}\n`));
       }
     }
   }

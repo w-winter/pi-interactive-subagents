@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
+import { withIsolatedAgentEnv, writeAgentFile } from "./helpers/agent-fixtures.ts";
 
 import {
   getLeafId,
@@ -143,45 +144,6 @@ function withMockedNow<T>(now: number, fn: () => T): T {
   }
 }
 
-function writeAgentFile(
-  agentsDir: string,
-  name: string,
-  frontmatter: string,
-  body = "You are a test agent.",
-) {
-  mkdirSync(agentsDir, { recursive: true });
-  writeFileSync(join(agentsDir, `${name}.md`), `---\n${frontmatter}\n---\n\n${body}\n`);
-}
-
-async function withIsolatedAgentEnv(
-  fn: (paths: {
-    projectDir: string;
-    projectAgentsDir: string;
-    globalDir: string;
-    globalAgentsDir: string;
-  }) => Promise<void> | void,
-) {
-  const root = createTestDir();
-  const previousCwd = process.cwd();
-  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
-  const projectDir = join(root, "project");
-  const projectAgentsDir = join(projectDir, ".pi", "agents");
-  const globalDir = join(root, "global");
-  const globalAgentsDir = join(globalDir, "agents");
-
-  mkdirSync(projectAgentsDir, { recursive: true });
-  mkdirSync(globalAgentsDir, { recursive: true });
-  process.chdir(projectDir);
-  process.env.PI_CODING_AGENT_DIR = globalDir;
-
-  try {
-    await fn({ projectDir, projectAgentsDir, globalDir, globalAgentsDir });
-  } finally {
-    process.chdir(previousCwd);
-    restoreEnvVar("PI_CODING_AGENT_DIR", previousAgentDir);
-    rmSync(root, { recursive: true, force: true });
-  }
-}
 const SESSION_HEADER = { type: "session", id: "sess-001", version: 3 };
 const MODEL_CHANGE = { type: "model_change", id: "mc-001", parentId: null };
 const USER_MSG = {

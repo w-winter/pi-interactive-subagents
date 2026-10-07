@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, symlinkSyn
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext, ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Value } from "@sinclair/typebox/value";
 import { Type } from "@sinclair/typebox";
 import subagentsExtension, { __test__ } from "../pi-extension/subagents/index.ts";
@@ -61,6 +61,8 @@ type LifecycleHook = (event: { type: string; reason: LifecycleReason }, ctx: Ext
 
 function lifecycleRuntime(extension = subagentsExtension) {
   const registered = new Map<string, (params: LifecycleRequest, ctx: ExtensionContext) => ReturnType<ToolDefinition["execute"]>>();
+  const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+  const userMessages: string[] = [];
   const hooks = new Map<string, LifecycleHook>();
   const messages: Parameters<ExtensionAPI["sendMessage"]>[0][] = [];
   let deliver: (message: Parameters<ExtensionAPI["sendMessage"]>[0]) => void = () => {};
@@ -71,7 +73,8 @@ function lifecycleRuntime(extension = subagentsExtension) {
         return tool.execute("test", params, undefined, undefined, ctx);
       });
     },
-    registerCommand() {}, registerMessageRenderer() {},
+    registerCommand(name, command) { commands.set(name, command); }, registerMessageRenderer() {},
+    sendUserMessage(message) { assert.ok(Value.Check(Type.String(), message)); userMessages.push(message); },
     sendMessage(message) { messages.push(message); deliver(message); },
     getAllTools() { return []; },
   };
@@ -89,7 +92,7 @@ function lifecycleRuntime(extension = subagentsExtension) {
     getSessionFile: () => sessionFile, getSessionId: () => "parent", getSessionDir: () => root,
   } } as ExtensionContext;
   return {
-    root, sessionFile, ctx, messages,
+    root, sessionFile, ctx, messages, commands, userMessages,
     async event(event: string, reason: LifecycleReason, context = ctx) {
       const hook = hooks.get(event);
       assert.ok(hook);
@@ -209,7 +212,7 @@ describe("Parent lifecycle ownership", () => {
     process.env.PI_CODING_AGENT_DIR = join(directory, "claude-config");
     const agents = join(process.env.PI_CODING_AGENT_DIR, "agents");
     mkdirSync(agents, { recursive: true });
-    writeFileSync(join(agents, "reload-claude.md"), "---\ncli: claude\n---\nTest only.\n");
+    writeFileSync(join(agents, "reload-claude.md"), "---\nextension: pi-interactive-subagents\ncli: claude\n---\nTest only.\n");
     const old = lifecycleRuntime();
     await old.execute("subagent", { name: "Claude survivor", task: "Wait", agent: "reload-claude", cwd: old.root });
     await old.event("session_shutdown", "reload");
@@ -266,6 +269,118 @@ beforeEach(() => {
 function calls(): unknown[] {
   return readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
 }
+
+function fileTree(root: string): string[] {
+  return readdirSync(root).sort().flatMap((name) => {
+    const path = join(root, name);
+    return statSync(path).isDirectory()
+      ? [name + "/", ...fileTree(path).map((child) => `${name}/${child}`)]
+      : [name];
+  });
+}
+
+describe("Named launch membership", () => {
+  const cases = [
+    { name: "missing", content: null },
+    { name: "", content: null },
+    { name: "unmarked", content: "---\nname: unmarked\n---\nPrivate" },
+    { name: "foreign", content: "---\nextension: other\n---\nPrivate" },
+    { name: "list-marker", content: "---\nextension: [pi-interactive-subagents]\n---\nPrivate" },
+    { name: "invalid-yaml", content: "---\nextension: pi-interactive-subagents\nbroken: [\n---" },
+    { name: "invalid-profile", content: "---\nextension: pi-interactive-subagents\nprofile: private\n---\nPrivate" },
+  ];
+  for (const fixture of cases) {
+    it(`rejects ${JSON.stringify(fixture.name)} before creating child resources`, async (t) => {
+      const runtime = lifecycleRuntime();
+      const cwd = process.cwd();
+      const config = process.env.PI_CODING_AGENT_DIR;
+      process.chdir(runtime.root);
+      process.env.PI_CODING_AGENT_DIR = join(runtime.root, "config");
+      process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+      process.env.ORCA_TEST_SCENARIO = "waiting";
+      t.after(async () => {
+        await runtime.event("session_shutdown", "quit");
+        process.chdir(cwd);
+        if (config === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = config;
+      });
+      if (fixture.content !== null) {
+        const agents = join(runtime.root, ".pi/agents");
+        mkdirSync(agents, { recursive: true });
+        writeFileSync(join(agents, `${fixture.name}.md`), fixture.content);
+      }
+      const before = fileTree(runtime.root);
+      await assert.rejects(runtime.execute("subagent", { name: "Rejected", task: "Do not start", cwd: runtime.root, agent: fixture.name }),
+        (error: Error) => fixture.name.startsWith("invalid")
+          ? error.message.includes(join(runtime.root, ".pi/agents", `${fixture.name}.md`))
+          : error.message.includes("not found"));
+      assert.deepEqual(fileTree(runtime.root), before);
+      assert.equal(calls().some((call) => Array.isArray(call) && ["create", "send"].includes(call[1])), false);
+      assert.equal(__test__.runningSubagents.size, 0);
+      assert.deepEqual(runtime.messages, []);
+      const artifacts = join(import.meta.dirname, "artifacts/terminal-lifecycle");
+      mkdirSync(artifacts, { recursive: true });
+      writeFileSync(join(artifacts, `membership-${fixture.name || "empty"}.json`), JSON.stringify({ name: fixture.name, before, after: fileTree(runtime.root), calls: calls(), paidRequests: 0 }, null, 2));
+    });
+  }
+
+  it("launches canonical project defaults, rejects a removed prechecked role and still supports bare launch", async (t) => {
+    const runtime = lifecycleRuntime();
+    const previousCwd = process.cwd();
+    const previousConfig = process.env.PI_CODING_AGENT_DIR;
+    process.chdir(runtime.root);
+    process.env.PI_CODING_AGENT_DIR = join(runtime.root, "config");
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+    process.env.ORCA_TEST_SCENARIO = "waiting";
+    t.after(async () => {
+      await runtime.event("session_shutdown", "quit");
+      process.chdir(previousCwd);
+      if (previousConfig === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = previousConfig;
+    });
+    const globalAgents = join(process.env.PI_CODING_AGENT_DIR, "agents");
+    const projectAgents = join(runtime.root, ".pi/agents");
+    mkdirSync(globalAgents, { recursive: true });
+    mkdirSync(projectAgents, { recursive: true });
+    writeFileSync(join(globalAgents, "global-file.md"), "---\nextension: pi-interactive-subagents\nname: selected\nmodel: fixture/global\n---\nGlobal instructions");
+    writeFileSync(join(projectAgents, "project-file.md"), '---\nextension: pi-interactive-subagents\nname: selected\nmodel: "fixture/project # literal"\nsystem-prompt: replace\n---\nProject instructions');
+    const launched = await runtime.execute("subagent", { name: "Canonical", task: "Wait", agent: "selected", cwd: runtime.root });
+    const LaunchPaths = Type.Object({ launchScriptFile: Type.String() });
+    assert.ok(Value.Check(LaunchPaths, launched.details));
+    const script = readFileSync(launched.details.launchScriptFile, "utf8");
+    assert.ok(script.includes("fixture/project # literal"));
+    const context = join(runtime.root, "artifacts/parent/context");
+    const prompt = readdirSync(context).find(file => file.includes("sysprompt"));
+    assert.ok(prompt);
+    assert.equal(readFileSync(join(context, prompt), "utf8"), "Project instructions");
+    const command = runtime.commands.get("subagent");
+    assert.ok(command);
+    // SAFETY: A successful command precheck uses only the session-independent definition lookup and queued message API.
+    await command.handler("selected Continue", runtime.ctx as ExtensionCommandContext);
+    assert.equal(runtime.userMessages.length, 1);
+    execFileSync("trash", [join(projectAgents, "project-file.md"), join(globalAgents, "global-file.md")]);
+    const before = fileTree(runtime.root);
+    const mutationsBefore = calls().filter(call => Array.isArray(call) && ["create", "send"].includes(call[1])).length;
+    await assert.rejects(runtime.execute("subagent", { name: "Removed", task: "Wait", agent: "selected", cwd: runtime.root }), /not found/);
+    assert.deepEqual(fileTree(runtime.root), before);
+    assert.equal(calls().filter(call => Array.isArray(call) && ["create", "send"].includes(call[1])).length, mutationsBefore);
+    const bare = await runtime.execute("subagent", { name: "Bare", task: "Wait", cwd: runtime.root });
+    assert.match(JSON.stringify(bare.content), /launched/);
+    const model = "fixture/model # literal";
+    const environment = createTestEnv("orca", model);
+    try {
+      process.chdir(environment.dir);
+      assert.equal(__test__.loadAgentDefaults("test-echo").model, model);
+      assert.equal(__test__.loadAgentDefaults("test-ping").model, model);
+    } finally {
+      process.chdir(runtime.root);
+      execFileSync("trash", [environment.dir]);
+    }
+    const artifacts = join(import.meta.dirname, "artifacts/terminal-lifecycle");
+    mkdirSync(artifacts, { recursive: true });
+    writeFileSync(join(artifacts, "membership-receipt.json"), JSON.stringify({ canonicalProjectLaunch: true, rejectedStalePrecheck: true, bareLaunch: true, selectedModel: model, calls: calls(), paidRequests: 0 }, null, 2));
+  });
+});
 
 describe("Orca backend", () => {
   it("detects an Orca terminal without an explicit backend override", () => {
@@ -423,8 +538,8 @@ describe("Orca backend", () => {
     process.env.PI_CODING_AGENT_DIR = join(directory, "agent");
     const agentDir = join(process.env.PI_CODING_AGENT_DIR, "agents");
     mkdirSync(agentDir, { recursive: true });
-    writeFileSync(join(agentDir, "lifecycle-claude.md"), "---\ncli: claude\n---\nTest agent.\n");
-    writeFileSync(join(agentDir, "lifecycle-interactive.md"), "---\nsystem-prompt: replace\n---\nWait for the user's next request.\n");
+    writeFileSync(join(agentDir, "lifecycle-claude.md"), "---\nextension: pi-interactive-subagents\ncli: claude\n---\nTest agent.\n");
+    writeFileSync(join(agentDir, "lifecycle-interactive.md"), "---\nextension: pi-interactive-subagents\nsystem-prompt: replace\n---\nWait for the user's next request.\n");
     const modelEnv = createTestEnv("orca", "fixture/selected-model");
     const previousCwd = process.cwd();
     process.chdir(modelEnv.dir);
