@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
+import { Value } from "@sinclair/typebox/value";
 import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,6 +13,7 @@ import {
   mkdirSync,
   copyFileSync,
   unlinkSync,
+  realpathSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { buildModelArgs, buildResumeArgs, conversationArgs, readConversationProfile, type ConversationProfile } from "./conversation-profile.ts";
@@ -56,12 +58,9 @@ import {
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 
-// Survive /reload: clear timers and abort poll loops from the previous module load.
-// /reload re-imports this file, giving fresh module-level state, but closures from
-// the old module keep running. See https://github.com/HazAT/pi-interactive-subagents/issues/5
+// Reload replaces observers, while child processes and their tracking survive.
 const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
 const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
-const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
 
 {
   const prevInterval = (globalThis as any)[WIDGET_INTERVAL_KEY];
@@ -74,14 +73,12 @@ const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
     clearInterval(prevStatusInterval);
     (globalThis as any)[STATUS_INTERVAL_KEY] = null;
   }
-  const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-  if (prevAbort) prevAbort.abort();
-  (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
 }
 
-function getModuleAbortSignal(): AbortSignal {
-  return ((globalThis as any)[POLL_ABORT_KEY] as AbortController).signal;
-}
+const ShutdownEvent = Type.Object({ reason: Type.Union([
+  Type.Literal("reload"), Type.Literal("quit"), Type.Literal("new"),
+  Type.Literal("resume"), Type.Literal("fork"),
+]) });
 
 const SubagentParams = Type.Object({
   name: Type.String({ description: "Display name for the subagent" }),
@@ -508,6 +505,7 @@ interface RunningSubagent {
   startTime: number;
   sessionFile: string;
   launchScriptFile?: string;
+  stderrFile?: string;
   activityFile?: string;
   activity?: SubagentActivityState;
   activityRead?: {
@@ -515,7 +513,7 @@ interface RunningSubagent {
     reason?: "missing" | "invalid" | "wrong-id";
     error?: string;
   };
-  abortController?: AbortController;
+  completion: { kind: "fresh" } | { kind: "resume"; entryCountBefore: number };
   cli?: string;
   sentinelFile?: string;
   statusState: SubagentStatusState;
@@ -528,8 +526,16 @@ interface RunningSubagent {
   interactive: boolean;
 }
 
+const RUNNING_STATE_KEY = Symbol.for("pi-subagents/running-state");
+interface RunningState {
+  agents: Map<string, RunningSubagent>;
+  pendingResumes: Set<string>;
+}
+// SAFETY: This module exclusively initializes and accesses this process-local symbol.
+const runtimeGlobal = globalThis as typeof globalThis & { [RUNNING_STATE_KEY]?: RunningState };
+const runningState = runtimeGlobal[RUNNING_STATE_KEY] ??= { agents: new Map(), pendingResumes: new Set() };
 /** All currently running subagents, keyed by id. */
-const runningSubagents = new Map<string, RunningSubagent>();
+const runningSubagents = runningState.agents;
 
 // ── Widget management ──
 
@@ -1005,7 +1011,7 @@ async function launchSubagent(
     Math.random().toString(16).slice(2, 10),
     Math.random().toString(16).slice(2, 6),
   ].join("-");
-  const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
+  const subagentSessionFile = join(realpathSync(sessionDir), `${timestamp}_${uuid}.jsonl`);
 
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
@@ -1099,6 +1105,7 @@ async function launchSubagent(
       sessionFile: subagentSessionFile,
       launchScriptFile,
       cli: "claude",
+      completion: { kind: "fresh" },
       sentinelFile,
       interactive: effectiveInteractive,
       statusState: createStatusState({
@@ -1218,7 +1225,7 @@ async function launchSubagent(
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
+  const { command, stderrFile } = buildPiLaunchCommand(piCommand, artifactDir, id);
   const launchScriptName = `${(params.name || "subagent")
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, "")
@@ -1245,7 +1252,9 @@ async function launchSubagent(
     startTime,
     sessionFile: subagentSessionFile,
     launchScriptFile,
+    stderrFile,
     activityFile,
+    completion: { kind: "fresh" },
     interactive: effectiveInteractive,
     statusState: createStatusState({
       source: "pi",
@@ -1255,6 +1264,14 @@ async function launchSubagent(
 
   runningSubagents.set(id, running);
   return running;
+}
+
+function buildPiLaunchCommand(piCommand: string, artifactDir: string, id: string) {
+  const stderrFile = join(artifactDir, "subagent-stderr", `${id}.log`);
+  mkdirSync(dirname(stderrFile), { recursive: true });
+  writeFileSync(stderrFile, "", { mode: 0o600, flag: "wx" });
+  // Keep stdout on the TTY; stderr must survive terminal closure even on a fatal exit.
+  return { stderrFile, command: `{ ${piCommand}; } 2>>${shellEscape(stderrFile)}; echo '__SUBAGENT_DONE_'$?'__'` };
 }
 
 /**
@@ -1286,18 +1303,22 @@ function copyClaudeSession(sentinelFile: string): string | null {
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
-): Promise<SubagentResult> {
+): Promise<SubagentResult | null> {
   const { name, task, surface, startTime, sessionFile } = running;
 
   try {
-    const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
+    const result = await pollForExit(surface, signal, {
       interval: 1000,
       sessionFile,
       sentinelFile: running.sentinelFile,
       onTick() {
         observeRunningSubagent(running);
       },
+    }).catch((err) => {
+      if (signal.aborted && signal.reason === "reload") return null;
+      throw err instanceof Error ? err : new Error(String(err));
     });
+    if (!result) return null;
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 
@@ -1413,13 +1434,67 @@ async function watchSubagent(
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
+  const observerAbort = new AbortController();
+  const observers = new Set<Promise<void>>();
+  const observedIds = new Set<string>();
+
+  function observeChild(running: RunningSubagent) {
+    if (observedIds.has(running.id)) return;
+    observedIds.add(running.id);
+    const observer = watchSubagent(running, observerAbort.signal).then((result) => {
+      if (!result) return;
+      updateWidget();
+      if (result.ping) {
+        const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
+        pi.sendMessage({
+          customType: "subagent_ping",
+          content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
+          display: true,
+          details: { name: result.ping.name, message: result.ping.message, agent: running.agent, sessionFile: result.sessionFile },
+        }, { triggerTurn: true, deliverAs: "steer" });
+        return;
+      }
+      const summary = running.completion.kind === "resume"
+        ? resolveResumeSummary(getNewEntries(running.sessionFile, running.completion.entryCountBefore), result)
+        : result.summary;
+      pi.sendMessage({
+        customType: "subagent_result",
+        content: resolveResultPresentation({ ...result, summary }, running.name) +
+          (result.exitCode !== 0 && running.stderrFile ? `\n\nStderr: ${running.stderrFile}` : ""),
+        display: true,
+        details: {
+          name: running.name, task: running.task, agent: running.agent,
+          exitCode: result.exitCode, elapsed: result.elapsed, exitReason: result.exitReason,
+          sessionFile: result.sessionFile,
+          stderrFile: running.stderrFile,
+          errorMessage: result.errorMessage,
+          claudeSessionId: result.claudeSessionId,
+        },
+      }, { triggerTurn: true, deliverAs: "steer" });
+    }).catch((err) => {
+      updateWidget();
+      const error = err instanceof Error ? err.message : String(err);
+      pi.sendMessage({
+        customType: "subagent_result", content: `Sub-agent "${running.name}" error: ${error}`,
+        display: true, details: { name: running.name, task: running.task, error },
+      }, { triggerTurn: true, deliverAs: "steer" });
+    }).finally(() => { observers.delete(observer); observedIds.delete(running.id); });
+    observers.add(observer);
+  }
+
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
+    for (const running of runningSubagents.values()) observeChild(running);
+    if (runningSubagents.size) {
+      startWidgetRefresh();
+      startStatusRefresh(pi);
+    }
   });
 
   // Clean up on session shutdown
-  pi.on("session_shutdown", (_event, _ctx) => {
+  pi.on("session_shutdown", async (event, _ctx) => {
+    const { reason } = Value.Decode(ShutdownEvent, event);
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -1430,12 +1505,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       statusInterval = null;
       (globalThis as any)[STATUS_INTERVAL_KEY] = null;
     }
-    const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
-    if (moduleAbort) moduleAbort.abort();
-    for (const [_id, agent] of runningSubagents) {
-      agent.abortController?.abort();
-    }
-    runningSubagents.clear();
+    observerAbort.abort(reason);
+    // Pi invalidates this extension API after shutdown; finish real deliveries first.
+    await Promise.all(observers);
+    if (reason !== "reload") runningSubagents.clear();
+    console.info(`[subagents:parent-lifecycle] ${JSON.stringify({ reason, retainedChildren: runningSubagents.size })}`);
   });
 
   // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
@@ -1504,74 +1578,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Launch the subagent (creates pane, sends command)
         const running = await launchSubagent(params, ctx);
 
-        // Create a separate AbortController for the watcher
-        // (the tool's signal completes when we return)
-        const watcherAbort = new AbortController();
-        running.abortController = watcherAbort;
-
-        // Start widget refresh and status supervision when the first agent launches
         startWidgetRefresh();
         startStatusRefresh(pi);
-
-        // Fire-and-forget: start watching in background
-        watchSubagent(running, watcherAbort.signal)
-          .then((result) => {
-            updateWidget(); // reflect removal from Map immediately
-
-            if (result.ping) {
-              // Subagent is requesting help — steer a ping message with session path for resume
-              const sessionRef = `\n\nSession: ${result.sessionFile}\nResume: pi --session ${result.sessionFile}`;
-              pi.sendMessage(
-                {
-                  customType: "subagent_ping",
-                  content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
-                  display: true,
-                  details: {
-                    name: result.ping.name,
-                    message: result.ping.message,
-                    agent: running.agent,
-                    sessionFile: result.sessionFile,
-                  },
-                },
-                { triggerTurn: true, deliverAs: "steer" },
-              );
-              return;
-            }
-
-            const presentation = resolveResultPresentation(result, running.name);
-
-            pi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: presentation,
-                display: true,
-                details: {
-                  name: running.name,
-                  task: running.task,
-                  agent: running.agent,
-                  exitCode: result.exitCode,
-                  elapsed: result.elapsed,
-                  exitReason: result.exitReason,
-                  sessionFile: result.sessionFile,
-                  ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-                  ...(result.claudeSessionId ? { claudeSessionId: result.claudeSessionId } : {}),
-                },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          })
-          .catch((err) => {
-            updateWidget();
-            pi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
-                display: true,
-                details: { name: running.name, task: running.task, error: err?.message },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          });
+        observeChild(running);
 
         // Return immediately
         return {
@@ -1592,6 +1601,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             agent: params.agent,
             sessionFile: running.sessionFile,
             launchScriptFile: running.launchScriptFile,
+            stderrFile: running.stderrFile,
             status: "started",
           },
         };
@@ -1846,180 +1856,147 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        // Record entry count before resuming so we can extract new messages
-        const entriesBefore = getNewEntries(params.sessionPath, 0);
-        const entryCountBefore = entriesBefore.length;
-        const conversationProfile = readConversationProfile(entriesBefore);
-        if (conversationProfile && !existsSync(conversationProfile.systemPromptPath)) {
-          throw new Error(`Conversation system prompt is missing: ${conversationProfile.systemPromptPath}`);
+        const sessionPath = realpathSync(params.sessionPath);
+        const active = Array.from(runningSubagents.values()).some((running) =>
+          running.cli !== "claude" && running.sessionFile === sessionPath);
+        if (active || runningState.pendingResumes.has(sessionPath)) {
+          console.warn(`[subagents:resume] ${JSON.stringify({ event: "duplicate_rejected", sessionPath })}`);
+          return {
+            isError: true,
+            content: [{ type: "text", text: `Error: session is already running or already being resumed: ${sessionPath}` }],
+            details: { error: "session already running", sessionPath },
+          };
         }
+        runningState.pendingResumes.add(sessionPath);
+        let surface: string | undefined;
+        try {
+          // Record entry count before resuming so we can extract new messages
+          const entriesBefore = getNewEntries(sessionPath, 0);
+          const entryCountBefore = entriesBefore.length;
+          const conversationProfile = readConversationProfile(entriesBefore);
+          if (conversationProfile && !existsSync(conversationProfile.systemPromptPath)) {
+            throw new Error(`Conversation system prompt is missing: ${conversationProfile.systemPromptPath}`);
+          }
 
-        const surface = createSurface(name);
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+          surface = createSurface(name);
+          await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
-        // Build pi resume command
-        const parts = ["/opt/homebrew/bin/pi", "--session", shellEscape(params.sessionPath)];
+          // Build pi resume command
+          const parts = ["/opt/homebrew/bin/pi", "--session", shellEscape(sessionPath)];
 
-        // Load subagent-done extension so the agent can self-terminate if needed
-        const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-        parts.push("-e", shellEscape(subagentDonePath));
-        parts.push(...buildResumeArgs(params.sessionPath, conversationProfile).map(shellEscape));
+          // Load subagent-done extension so the agent can self-terminate if needed
+          const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
+          parts.push("-e", shellEscape(subagentDonePath));
+          parts.push(...buildResumeArgs(sessionPath, conversationProfile).map(shellEscape));
 
-        const sessionId = ctx.sessionManager.getSessionId();
-        const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
-        const activityFile = getSubagentActivityFile(artifactDir, id);
-        mkdirSync(dirname(activityFile), { recursive: true });
+          const sessionId = ctx.sessionManager.getSessionId();
+          const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
+          const activityFile = getSubagentActivityFile(artifactDir, id);
+          mkdirSync(dirname(activityFile), { recursive: true });
 
-        let resumeMsgFile: string | undefined;
-        if (params.message) {
-          const msgTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-          resumeMsgFile = join(
+          let resumeMsgFile: string | undefined;
+          if (params.message) {
+            const msgTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+            resumeMsgFile = join(
+              artifactDir,
+              "subagent-resume",
+              `${name
+                .toLowerCase()
+                .replace(/[^a-z0-9\s-]/g, "")
+                .replace(/\s+/g, "-")
+                .replace(/-+/g, "-")
+                .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}.md`,
+            );
+            mkdirSync(dirname(resumeMsgFile), { recursive: true });
+            writeFileSync(resumeMsgFile, params.message, "utf8");
+            parts.push(shellEscape(`@${resumeMsgFile}`));
+          }
+
+          // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
+          const resumeEnvParts: string[] = [];
+          if (conversationProfile) {
+            resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(conversationProfile.agentDir)}`);
+            resumeEnvParts.push(`PI_SUBAGENT_CONVERSATION_PROFILE=${shellEscape(JSON.stringify(conversationProfile))}`);
+          } else if (process.env.PI_CODING_AGENT_DIR) {
+            resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
+          }
+          resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
+          resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(sessionPath)}`);
+          resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
+          resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
+          resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=${autoExit ? "1" : "0"}`);
+          const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
+
+          const cdPrefix = conversationProfile ? `cd ${shellEscape(conversationProfile.cwd)} && ` : "";
+          const { command, stderrFile } = buildPiLaunchCommand(`${cdPrefix}${resumeEnvPrefix}${parts.join(" ")}`, artifactDir, id);
+          const launchScriptFile = join(
             artifactDir,
-            "subagent-resume",
+            "subagent-scripts",
             `${name
               .toLowerCase()
               .replace(/[^a-z0-9\s-]/g, "")
               .replace(/\s+/g, "-")
               .replace(/-+/g, "-")
-              .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}.md`,
+              .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
           );
-          mkdirSync(dirname(resumeMsgFile), { recursive: true });
-          writeFileSync(resumeMsgFile, params.message, "utf8");
-          parts.push(shellEscape(`@${resumeMsgFile}`));
-        }
-
-        // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
-        const resumeEnvParts: string[] = [];
-        if (conversationProfile) {
-          resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(conversationProfile.agentDir)}`);
-          resumeEnvParts.push(`PI_SUBAGENT_CONVERSATION_PROFILE=${shellEscape(JSON.stringify(conversationProfile))}`);
-        } else if (process.env.PI_CODING_AGENT_DIR) {
-          resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
-        }
-        resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(params.sessionPath)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=${autoExit ? "1" : "0"}`);
-        const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
-
-        const cdPrefix = conversationProfile ? `cd ${shellEscape(conversationProfile.cwd)} && ` : "";
-        const command = `${cdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
-        const launchScriptFile = join(
-          artifactDir,
-          "subagent-scripts",
-          `${name
-            .toLowerCase()
-            .replace(/[^a-z0-9\s-]/g, "")
-            .replace(/\s+/g, "-")
-            .replace(/-+/g, "-")
-            .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
-        );
-        sendLongCommand(surface, command, {
-          scriptPath: launchScriptFile,
-          scriptPreamble: [
-            `# Subagent resume script for ${name}`,
-            `# Generated: ${new Date().toISOString()}`,
-            `# Session: ${params.sessionPath}`,
-            `# Surface: ${surface}`,
-            ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
-          ].join("\n"),
-        });
-
-        // Register as a running subagent for widget tracking
-        const running: RunningSubagent = {
-          id,
-          name,
-          task: params.message ?? "resumed session",
-          surface,
-          startTime,
-          sessionFile: params.sessionPath,
-          launchScriptFile,
-          activityFile,
-          interactive,
-          statusState: createStatusState({
-            source: "pi",
-            startTimeMs: startTime,
-          }),
-        };
-        runningSubagents.set(id, running);
-        startWidgetRefresh();
-        startStatusRefresh(pi);
-
-        // Fire-and-forget watcher
-        const watcherAbort = new AbortController();
-        running.abortController = watcherAbort;
-
-        watchSubagent(running, watcherAbort.signal)
-          .then((result) => {
-            updateWidget();
-
-            if (result.ping) {
-              const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
-              pi.sendMessage(
-                {
-                  customType: "subagent_ping",
-                  content: `Sub-agent "${result.ping.name}" needs help (${formatElapsed(result.elapsed)}):\n\n${result.ping.message}${sessionRef}`,
-                  display: true,
-                  details: {
-                    name: result.ping.name,
-                    message: result.ping.message,
-                    sessionFile: params.sessionPath,
-                  },
-                },
-                { triggerTurn: true, deliverAs: "steer" },
-              );
-              return;
-            }
-
-            const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
-            const summary = resolveResumeSummary(allEntries, result);
-            const presentation = resolveResultPresentation(
-              { ...result, summary, sessionFile: params.sessionPath },
-              name,
-            );
-
-            pi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: presentation,
-                display: true,
-                details: {
-                  name,
-                  task: params.message ?? "resumed session",
-                  exitCode: result.exitCode,
-                  elapsed: result.elapsed,
-                  exitReason: result.exitReason,
-                  sessionFile: params.sessionPath,
-                  ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-                },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
-          })
-          .catch((err) => {
-            updateWidget();
-            pi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: `Resume error: ${err?.message ?? String(err)}`,
-                display: true,
-                details: { name, error: err?.message },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
+          sendLongCommand(surface, command, {
+            scriptPath: launchScriptFile,
+            scriptPreamble: [
+              `# Subagent resume script for ${name}`,
+              `# Generated: ${new Date().toISOString()}`,
+              `# Session: ${sessionPath}`,
+              `# Surface: ${surface}`,
+              ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
+            ].join("\n"),
           });
 
-        return {
-          content: [{ type: "text", text: `Session "${name}" resumed.` }],
-          details: {
+          // Register as a running subagent for widget tracking
+          const running: RunningSubagent = {
             id,
             name,
-            sessionPath: params.sessionPath,
+            task: params.message ?? "resumed session",
+            surface,
+            startTime,
+            sessionFile: sessionPath,
             launchScriptFile,
-            status: "started",
-          },
-        };
+            stderrFile,
+            activityFile,
+            completion: { kind: "resume", entryCountBefore },
+            interactive,
+            statusState: createStatusState({
+              source: "pi",
+              startTimeMs: startTime,
+            }),
+          };
+          runningSubagents.set(id, running);
+          startWidgetRefresh();
+          startStatusRefresh(pi);
+
+          observeChild(running);
+
+          return {
+            content: [{ type: "text", text: `Session "${name}" resumed.` }],
+            details: {
+              id,
+              name,
+              sessionPath,
+              launchScriptFile,
+              stderrFile,
+              status: "started",
+            },
+          };
+        } catch (error) {
+          if (surface) {
+            try { closeSurface(surface); }
+            catch (cleanupError) {
+              console.error(`[subagents:resume] ${JSON.stringify({ event: "cleanup_failed", surface })}`);
+              throw new AggregateError([error, cleanupError], "Resume startup and terminal cleanup failed");
+            }
+          }
+          throw error;
+        } finally {
+          runningState.pendingResumes.delete(sessionPath);
+        }
       },
     });
 

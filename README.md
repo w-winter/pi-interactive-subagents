@@ -120,6 +120,10 @@ Multiple subagents run concurrently — each steers its result back independentl
 
 Completion messages render with a colored background and are expandable with `Ctrl+O` to show the full summary and session file path.
 
+Running children stay open across a parent `/reload`. The parent reconnects its status display and completion delivery after reloading. Quitting or replacing the parent session closes its tracked children. Within one parent process, `subagent_resume` reports an error if that session is already running or another resume is starting, including when the supplied path is a symlink to the same file.
+
+Pi child stderr, including startup warnings and fatal errors, is written to a private file under the parent's session artifacts in `subagent-stderr/`. Launch acknowledgements include `stderrFile`, and failure messages include its path. Stdout remains connected to the interactive terminal. Check the stderr file when a child fails; review it for sensitive content before sharing it.
+
 The task determines the final assistant response's content and format.
 
 ### In-progress status updates

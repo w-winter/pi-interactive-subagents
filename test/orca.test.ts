@@ -1,11 +1,12 @@
 import { after, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { Value } from "@sinclair/typebox/value";
+import { Type } from "@sinclair/typebox";
 import subagentsExtension, { __test__ } from "../pi-extension/subagents/index.ts";
 import { createTestEnv, startPi } from "./integration/harness.ts";
 import { pollForExit } from "../pi-extension/subagents/completion.ts";
@@ -50,6 +51,206 @@ console.log(JSON.stringify({ ok: scenario !== "not-ok", result }));
 after(() => {
   process.env = originalEnv;
   execFileSync("trash", [directory]);
+});
+
+type LifecycleRequest =
+  | { name: string; task: string; cwd: string; agent?: string }
+  | { sessionPath: string; name?: string };
+type LifecycleReason = "startup" | "reload" | "quit" | "new" | "resume" | "fork";
+type LifecycleHook = (event: { type: string; reason: LifecycleReason }, ctx: ExtensionContext) => void | Promise<void>;
+
+function lifecycleRuntime(extension = subagentsExtension) {
+  const registered = new Map<string, (params: LifecycleRequest, ctx: ExtensionContext) => ReturnType<ToolDefinition["execute"]>>();
+  const hooks = new Map<string, LifecycleHook>();
+  const messages: Parameters<ExtensionAPI["sendMessage"]>[0][] = [];
+  let deliver: (message: Parameters<ExtensionAPI["sendMessage"]>[0]) => void = () => {};
+  const api: Partial<ExtensionAPI> = {
+    registerTool(tool) {
+      registered.set(tool.name, async (params, ctx) => {
+        assert.ok(Value.Check(tool.parameters, params));
+        return tool.execute("test", params, undefined, undefined, ctx);
+      });
+    },
+    registerCommand() {}, registerMessageRenderer() {},
+    sendMessage(message) { messages.push(message); deliver(message); },
+    getAllTools() { return []; },
+  };
+  // SAFETY: This double implements the registration and delivery APIs used by the lifecycle tests.
+  extension({ ...api, on(event: string, handler: LifecycleHook) { hooks.set(event, handler); } } as ExtensionAPI);
+  const root = mkdtempSync(join(directory, "lifecycle-"));
+  const sessionFile = join(root, "parent.jsonl");
+  writeFileSync(sessionFile, [
+    { type: "session", version: 3, id: "parent", cwd: root },
+    { type: "model_change", id: "model", parentId: null, provider: "fixture", modelId: "unpaid" },
+    { type: "thinking_level_change", id: "thinking", parentId: "model", thinkingLevel: "off" },
+  ].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+  // SAFETY: No interactive UI or real child runs; the tools use only these session paths and cwd.
+  const ctx = { cwd: root, hasUI: false, sessionManager: {
+    getSessionFile: () => sessionFile, getSessionId: () => "parent", getSessionDir: () => root,
+  } } as ExtensionContext;
+  return {
+    root, sessionFile, ctx, messages,
+    async event(event: string, reason: LifecycleReason, context = ctx) {
+      const hook = hooks.get(event);
+      assert.ok(hook);
+      await hook({ type: event, reason }, context);
+    },
+    nextMessage: () => new Promise<Parameters<ExtensionAPI["sendMessage"]>[0]>((resolve) => { deliver = resolve; }),
+    async execute(name: string, params: LifecycleRequest) {
+      const tool = registered.get(name);
+      assert.ok(tool);
+      return tool(params, ctx);
+    },
+  };
+}
+
+describe("Parent lifecycle ownership", () => {
+  for (const resumed of [false, true]) {
+    it(`reattaches a ${resumed ? "resumed" : "fresh"} child after module reload and delivers once`, { timeout: 5000 }, async (t) => {
+      process.env.ORCA_TEST_SCENARIO = "waiting";
+      process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+      process.env.PI_CODING_AGENT_DIR = join(directory, "isolated-config");
+      const old = lifecycleRuntime();
+      t.after(() => old.event("session_shutdown", "quit"));
+      await old.event("session_start", "startup");
+      const launched = await old.execute(resumed ? "subagent_resume" : "subagent", resumed
+        ? { name: "Reload child", sessionPath: old.sessionFile }
+        : { name: "Reload child", task: "Wait", cwd: old.root });
+      const active = Array.from(__test__.runningSubagents.values()).find((child) => child.name === "Reload child");
+      assert.ok(active);
+      const childSession = active.sessionFile;
+      await old.event("session_shutdown", "reload");
+      assert.ok(!calls().some((call) => Array.isArray(call) && call[1] === "close"), "reload must not close the child");
+      assert.deepEqual(old.messages, [], "observer detachment must not report cancellation");
+      // A fresh import models Pi replacing the extension module during /reload.
+      const reloaded = await import(`../pi-extension/subagents/index.ts?reload=${resumed}`);
+      const next = lifecycleRuntime(reloaded.default);
+      t.after(() => next.event("session_shutdown", "quit", old.ctx));
+      assert.equal(reloaded.__test__.runningSubagents.size, 1, "the child must remain tracked after reload");
+      const delivered = next.nextMessage();
+      if (!resumed) writeFileSync(childSession, readFileSync(old.sessionFile, "utf8"));
+      writeFileSync(childSession, readFileSync(childSession, "utf8") + JSON.stringify({
+        type: "message", message: { role: "assistant", content: [{ type: "text", text: "Result after reload" }] },
+      }) + "\n", { flag: "w" });
+      writeFileSync(`${childSession}.exit`, JSON.stringify({ type: "done" }));
+      await next.event("session_start", "reload", old.ctx);
+      const result = await delivered;
+      assert.match(JSON.stringify(result.content), /Result after reload/);
+      assert.equal(next.messages.length, 1);
+      assert.equal(old.messages.length, 0);
+      assert.equal(reloaded.__test__.runningSubagents.size, 0);
+      const artifacts = join(import.meta.dirname, "artifacts", "parent-lifecycle");
+      mkdirSync(artifacts, { recursive: true });
+      writeFileSync(join(artifacts, `reload-${resumed}.json`), JSON.stringify({ launched, result, calls: calls(), paidRequests: 0 }, null, 2));
+    });
+  }
+
+  it("rejects concurrent and alias resumes, then releases a failed launch claim", { timeout: 5000 }, async (t) => {
+    process.env.ORCA_TEST_SCENARIO = "waiting";
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+    const runtime = lifecycleRuntime();
+    t.after(() => runtime.event("session_shutdown", "quit"));
+    const params = { name: "Resume owner", sessionPath: runtime.sessionFile };
+    const first = runtime.execute("subagent_resume", params);
+    const concurrent = await runtime.execute("subagent_resume", params);
+    assert.match(JSON.stringify(concurrent.content), /already (running|being resumed)/);
+    await first;
+    const alias = join(runtime.root, "alias.jsonl");
+    symlinkSync(runtime.sessionFile, alias);
+    const aliasResult = await runtime.execute("subagent_resume", { ...params, sessionPath: alias });
+    assert.match(JSON.stringify(aliasResult.content), /already (running|being resumed)/);
+    assert.equal(calls().filter((call) => Array.isArray(call) && call[1] === "create").length, 1);
+    await runtime.event("session_shutdown", "quit");
+    const retry = lifecycleRuntime();
+    t.after(() => retry.event("session_shutdown", "quit"));
+    process.env.ORCA_TEST_SCENARIO = "rejected";
+    await assert.rejects(retry.execute("subagent_resume", { name: "Retry", sessionPath: retry.sessionFile }), /Orca returned/);
+    assert.equal(calls().filter((call) => Array.isArray(call) && call[1] === "close").length, 2,
+      "quit closes the first runner and failed startup closes its unused terminal");
+    process.env.ORCA_TEST_SCENARIO = "waiting";
+    const retried = await retry.execute("subagent_resume", { name: "Retry", sessionPath: retry.sessionFile });
+    assert.match(JSON.stringify(retried.content), /resumed/);
+  });
+
+  it("rejects resuming a fresh active child and permits it after completion", { timeout: 5000 }, async (t) => {
+    process.env.ORCA_TEST_SCENARIO = "waiting";
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+    process.env.PI_CODING_AGENT_DIR = join(directory, "fresh-config");
+    const runtime = lifecycleRuntime();
+    t.after(() => runtime.event("session_shutdown", "quit"));
+    await runtime.execute("subagent", { name: "Fresh owner", task: "Wait", cwd: runtime.root });
+    const child = Array.from(__test__.runningSubagents.values()).find((entry) => entry.name === "Fresh owner");
+    assert.ok(child);
+    writeFileSync(child.sessionFile, readFileSync(runtime.sessionFile, "utf8"));
+    const duplicate = await runtime.execute("subagent_resume", { sessionPath: child.sessionFile });
+    assert.match(JSON.stringify(duplicate.content), /already running/);
+    const completed = runtime.nextMessage();
+    writeFileSync(`${child.sessionFile}.exit`, JSON.stringify({ type: "done" }));
+    await completed;
+    const resumed = await runtime.execute("subagent_resume", { sessionPath: child.sessionFile });
+    assert.match(JSON.stringify(resumed.content), /resumed/);
+  });
+
+  it("finishes a real completion during reload before invalidating the old delivery API", async () => {
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+    process.env.PI_CODING_AGENT_DIR = join(directory, "racing-config");
+    const runtime = lifecycleRuntime();
+    await runtime.execute("subagent", { name: "Finishing child", task: "Wait", cwd: runtime.root });
+    await runtime.event("session_shutdown", "reload");
+    assert.equal(runtime.messages.length, 1);
+    assert.match(JSON.stringify(runtime.messages[0].content), /failed \(exit code 7\)/);
+    assert.match(JSON.stringify(runtime.messages[0].content), /Stderr:/);
+    assert.equal(__test__.runningSubagents.size, 0);
+  });
+
+  it("keeps Claude children across reload and still closes children on parent quit", async (t) => {
+    process.env.ORCA_TEST_SCENARIO = "waiting";
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+    process.env.PI_CODING_AGENT_DIR = join(directory, "claude-config");
+    const agents = join(process.env.PI_CODING_AGENT_DIR, "agents");
+    mkdirSync(agents, { recursive: true });
+    writeFileSync(join(agents, "reload-claude.md"), "---\ncli: claude\n---\nTest only.\n");
+    const old = lifecycleRuntime();
+    await old.execute("subagent", { name: "Claude survivor", task: "Wait", agent: "reload-claude", cwd: old.root });
+    await old.event("session_shutdown", "reload");
+    assert.equal(old.messages.length, 0);
+    assert.ok(!calls().some((call) => Array.isArray(call) && call[1] === "close"));
+    const next = lifecycleRuntime();
+    t.after(() => next.event("session_shutdown", "quit"));
+    await next.event("session_start", "reload", old.ctx);
+    await next.event("session_shutdown", "quit");
+    assert.equal(next.messages.length, 1);
+    assert.ok(calls().some((call) => Array.isArray(call) && call[1] === "close"));
+    assert.equal(__test__.runningSubagents.size, 0);
+  });
+
+  for (const resumed of [false, true]) {
+    it(`retains stderr and exit status for a ${resumed ? "resumed" : "fresh"} Pi crash`, async (t) => {
+      process.env.ORCA_TEST_SCENARIO = "waiting";
+      process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+      process.env.PI_CODING_AGENT_DIR = join(directory, "crash-config");
+      const runtime = lifecycleRuntime();
+      t.after(() => runtime.event("session_shutdown", "quit"));
+      const launched = await runtime.execute(resumed ? "subagent_resume" : "subagent", resumed
+        ? { name: "Crash", sessionPath: runtime.sessionFile }
+        : { name: "Crash", task: "Wait", cwd: runtime.root });
+      const paths = Type.Object({ launchScriptFile: Type.String(), stderrFile: Type.String() });
+      assert.ok(Value.Check(paths, launched.details), "launch must advertise a durable stderr path");
+      const fakePi = join(runtime.root, "fake-pi.bash");
+      // Bash resolves this function at the external executable boundary, leaving the generated script unchanged.
+      writeFileSync(fakePi, "function /opt/homebrew/bin/pi() { printf 'TUI output\\n'; printf 'fatal handler error\\n' >&2; return 7; }\n");
+      const output = execFileSync("bash", [launched.details.launchScriptFile], {
+        encoding: "utf8", env: { ...process.env, BASH_ENV: fakePi },
+      });
+      assert.match(output, /TUI output\n__SUBAGENT_DONE_7__/);
+      assert.doesNotMatch(output, /fatal handler error/);
+      assert.equal(readFileSync(launched.details.stderrFile, "utf8"), "fatal handler error\n");
+      assert.equal(statSync(launched.details.stderrFile).mode & 0o777, 0o600);
+      const artifacts = join(import.meta.dirname, "artifacts", "parent-lifecycle");
+      mkdirSync(artifacts, { recursive: true });
+      writeFileSync(join(artifacts, `stderr-${resumed}.json`), JSON.stringify({ output, stderr: readFileSync(launched.details.stderrFile, "utf8"), paidRequests: 0 }, null, 2));
+    });
+  }
 });
 
 beforeEach(() => {
@@ -196,12 +397,9 @@ describe("Orca backend", () => {
     };
     type Message = Parameters<ExtensionAPI["sendMessage"]>[0];
     const tools = new Map<string, Tool>();
-    let shutdown = () => {};
+    let shutdown: () => void | Promise<void> = () => {};
     let deliver: (message: Message) => void = () => {};
     const api: Partial<ExtensionAPI> = {
-      on(event: string, handler: (...args: never[]) => void) {
-        if (event === "session_shutdown") shutdown = () => { handler(); };
-      },
       registerTool(tool) {
         tools.set(tool.name, {
           async execute(id, params, signal, update, ctx) {
@@ -215,8 +413,10 @@ describe("Orca backend", () => {
       getAllTools() { return []; },
     };
     // SAFETY: The runtime double supplies registration, delivery, and shutdown, the only API paths these tools use.
-    subagentsExtension(api as ExtensionAPI);
-    t.after(() => shutdown());
+    subagentsExtension({ ...api, on(event: string, handler: LifecycleHook) {
+      if (event === "session_shutdown") shutdown = () => handler({ type: event, reason: "quit" }, ctx);
+    } } as ExtensionAPI);
+    t.after(async () => { await shutdown(); });
     process.env.ORCA_TEST_SCENARIO = "closed-unreadable";
     process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
     process.env.PI_SUBAGENT_AUTO_EXIT = "1";
