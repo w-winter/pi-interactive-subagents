@@ -18,6 +18,7 @@ export default function (pi: ExtensionAPI) {
           registeredTools: pi.getAllTools().map((tool) => tool.name).sort(),
           systemPrompt: getContext().getSystemPrompt(), cwd: getContext().cwd,
           agentDir: process.env.PI_CODING_AGENT_DIR,
+          pid: process.pid,
         }) }],
         api: model.api, provider: model.provider, model: model.id,
         usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,

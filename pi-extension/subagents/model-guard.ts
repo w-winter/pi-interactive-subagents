@@ -1,8 +1,9 @@
 import { ExtensionRunner, SessionManager } from "@mariozechner/pi-coding-agent";
+import { readLaunchSettings } from "./launch-settings.ts";
 
 const GUARD_KEY = Symbol.for("pi-subagents/model-guard");
 
-/** Extensions can reselect the current model and thinking level; native manual controls can change them. */
+/** Protect model/thinking choices and persist tool selections made through extension controls. */
 export function installSubagentModelGuard(): void {
   const originalBindCore = ExtensionRunner.prototype.bindCore;
   if (GUARD_KEY in originalBindCore) return;
@@ -32,11 +33,26 @@ export function installSubagentModelGuard(): void {
         const selected = actions.getThinkingLevel();
         if (level !== selected) reject("thinking", selected, level);
       },
+      setActiveTools: (tools) => {
+        actions.setActiveTools(tools);
+        const { sessionManager } = this.createContext();
+        const settings = readLaunchSettings(sessionManager.getBranch(), sessionManager.getSessionId());
+        if (settings) actions.appendEntry("subagent-launch", { ...settings, tools: actions.getActiveTools() });
+      },
     }, contextActions, providerActions);
 
-    // Record CLI overrides of inherited fork history before any startup handler can run.
     const { sessionManager } = this.createContext();
     if (!(sessionManager instanceof SessionManager)) throw new Error("Subagent model guard requires Pi's native session manager");
+    // The registry is ready at session_start; restore before selectors apply operator overrides.
+    const emit = this.emit.bind(this);
+    this.emit = async (event) => {
+      if (event.type === "session_start") {
+        const launch = readLaunchSettings(sessionManager.getBranch(), sessionManager.getSessionId());
+        if (launch) actions.setActiveTools(launch.tools);
+      }
+      return emit(event);
+    };
+    // Record CLI overrides of inherited fork history before any startup handler can run.
     const branch = sessionManager.getBranch();
     const model = contextActions.getModel();
     const previousModel = branch.findLast((entry) => entry.type === "model_change");

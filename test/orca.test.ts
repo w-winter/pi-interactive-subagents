@@ -404,58 +404,80 @@ describe("Fresh Pi completion policy", () => {
     writeFileSync(join(artifacts, "settled-result.json"), JSON.stringify({ launched, result, output, notifications: runtime.messages.length, paidRequests: 0 }, null, 2));
   });
 
-  it("preserves the ordinary child's launch contract through resume", async (t) => {
-    const runtime = lifecycleRuntime();
-    t.after(() => runtime.event("session_shutdown", "quit"));
-    process.env.ORCA_TEST_SCENARIO = "waiting";
-    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
-    const agentDir = join(runtime.root, "config");
-    process.env.PI_CODING_AGENT_DIR = agentDir;
-    mkdirSync(join(agentDir, "agents"), { recursive: true });
-    writeFileSync(join(agentDir, "agents", "restricted.md"), [
-      "---", "extension: pi-interactive-subagents", "model: launch-audit/snapshot",
-      "tools: read", "spawning: false", "deny-tools: subagent_interrupt,subagents_list",
-      "system-prompt: append", "---", "ROLE_INSTRUCTION_FROM_LAUNCH",
-    ].join("\n"));
-    const provider = join(import.meta.dirname, "fixtures", "launch-audit-provider.ts");
-    const extension = join(import.meta.dirname, "..", "pi-extension", "subagents", "index.ts");
-    const fakePi = join(runtime.root, "offline-pi.bash");
-    writeFileSync(fakePi, `function /opt/homebrew/bin/pi() { command /opt/homebrew/bin/pi --mode json --offline --no-extensions --no-skills --no-context-files -e '${provider}' -e '${extension}' "$@"; }\n`);
-    const launched = await runtime.execute("subagent", {
-      name: "Restricted", agent: "restricted", task: "Report launch state", cwd: runtime.root, autoExit: true,
+  for (const restrictions of [
+    { name: "allowlist", fields: ["tools: read"] },
+    { name: "spawning", fields: ["spawning: false"] },
+    { name: "denied-tools", fields: ["deny-tools: subagent_interrupt,subagents_list"] },
+    { name: "combined", fields: ["tools: read", "spawning: false", "deny-tools: subagent_interrupt,subagents_list"] },
+  ]) {
+    it(`preserves the ordinary child's launch contract through resume (${restrictions.name})`, async (t) => {
+      const runtime = lifecycleRuntime();
+      t.after(() => runtime.event("session_shutdown", "quit"));
+      process.env.ORCA_TEST_SCENARIO = "waiting";
+      process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+      const agentDir = join(runtime.root, "config");
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      mkdirSync(join(agentDir, "agents"), { recursive: true });
+      mkdirSync(join(agentDir, "extensions", "tools"), { recursive: true });
+      writeFileSync(join(agentDir, "extensions", "tools", "tools.json"), JSON.stringify({ version: 2, overrides: { bash: "disabled" } }));
+      writeFileSync(join(agentDir, "agents", "restricted.md"), [
+        "---", "extension: pi-interactive-subagents", "model: launch-audit/snapshot",
+        ...restrictions.fields,
+        "system-prompt: append", "---", "ROLE_INSTRUCTION_FROM_LAUNCH",
+      ].join("\n"));
+      const provider = join(import.meta.dirname, "fixtures", "launch-audit-provider.ts");
+      const extension = join(import.meta.dirname, "..", "pi-extension", "subagents", "index.ts");
+      const fakePi = join(runtime.root, "offline-pi.bash");
+      writeFileSync(fakePi, `function /opt/homebrew/bin/pi() { command /opt/homebrew/bin/pi --mode json --offline --no-extensions --no-skills --no-context-files -e '${provider}' -e '${extension}' -e '/Users/ww/dot314/agent/extensions/tools/index.ts' "$@"; }\n`);
+      const launched = await runtime.execute("subagent", {
+        name: "Restricted", agent: "restricted", task: "Report launch state", cwd: runtime.root, autoExit: true,
+      });
+      const paths = Type.Object({ launchScriptFile: Type.String(), sessionFile: Type.String() });
+      assert.ok(Value.Check(paths, launched.details));
+      const freshDelivered = runtime.nextMessage();
+      execFileSync("bash", [launched.details.launchScriptFile], { env: { ...process.env, BASH_ENV: fakePi } });
+      await freshDelivered;
+      const first = findLastAssistantMessage(getBranchEntries(launched.details.sessionFile, 0));
+      assert.ok(first);
+      writeFileSync(join(agentDir, "agents", "restricted.md"), "---\nextension: pi-interactive-subagents\n---\nEDITED_DEFINITION\n");
+      process.env.PI_CODING_AGENT_DIR = join(runtime.root, "different-config");
+      const resumed = await runtime.execute("subagent_resume", {
+        sessionPath: launched.details.sessionFile, name: "Restricted resumed", message: "Report resumed state",
+      });
+      assert.ok(Value.Check(Type.Object({ launchScriptFile: Type.String() }), resumed.details));
+      const resumedDelivered = runtime.nextMessage();
+      execFileSync("bash", [resumed.details.launchScriptFile], { env: { ...process.env, BASH_ENV: fakePi } });
+      await resumedDelivered;
+      const last = findLastAssistantMessage(getBranchEntries(launched.details.sessionFile, 0));
+      assert.ok(last);
+      const Snapshot = Type.Object({
+        declaredTools: Type.Array(Type.String()), registeredTools: Type.Array(Type.String()),
+        systemPrompt: Type.String(), agentDir: Type.String(), cwd: Type.String(),
+      });
+      const fresh = Value.Decode(Snapshot, JSON.parse(first));
+      const afterResume = Value.Decode(Snapshot, JSON.parse(last));
+      const artifacts = join(import.meta.dirname, "artifacts", "resume-restrictions");
+      mkdirSync(artifacts, { recursive: true });
+      writeFileSync(join(artifacts, `receipt-${restrictions.name}.json`), JSON.stringify({ fresh, afterResume, paidRequests: 0 }, null, 2));
+      assert.equal(afterResume.cwd, fresh.cwd);
+      assert.deepEqual(afterResume.declaredTools, fresh.declaredTools);
+      assert.deepEqual(afterResume.registeredTools, fresh.registeredTools);
+      assert.equal(afterResume.agentDir, fresh.agentDir);
+      assert.match(afterResume.systemPrompt, /ROLE_INSTRUCTION_FROM_LAUNCH/);
+      assert.doesNotMatch(afterResume.systemPrompt, /EDITED_DEFINITION/);
+      if (restrictions.name === "combined") {
+        const entry = getBranchEntries(launched.details.sessionFile, 0)
+          .findLast((entry) => entry.type === "custom" && entry.customType === "subagent-launch");
+        assert.ok(entry);
+        const settings = Value.Decode(Type.Object({ systemPrompt: Type.Object({ path: Type.String() }) }), entry.data);
+        execFileSync("trash", [settings.systemPrompt.path]);
+        const creations = calls().filter((call) => Array.isArray(call) && call[1] === "create").length;
+        await assert.rejects(runtime.execute("subagent_resume", { sessionPath: launched.details.sessionFile }), /system prompt is missing/);
+        assert.equal(calls().filter((call) => Array.isArray(call) && call[1] === "create").length, creations);
+        writeFileSync(join(artifacts, "missing-role.json"), JSON.stringify({ rejectedBeforeTerminalCreation: true, paidRequests: 0 }));
+      }
     });
-    const paths = Type.Object({ launchScriptFile: Type.String(), sessionFile: Type.String() });
-    assert.ok(Value.Check(paths, launched.details));
-    const freshDelivered = runtime.nextMessage();
-    execFileSync("bash", [launched.details.launchScriptFile], { env: { ...process.env, BASH_ENV: fakePi } });
-    await freshDelivered;
-    const first = findLastAssistantMessage(getBranchEntries(launched.details.sessionFile, 0));
-    assert.ok(first);
-    process.env.PI_CODING_AGENT_DIR = join(runtime.root, "different-config");
-    const resumed = await runtime.execute("subagent_resume", {
-      sessionPath: launched.details.sessionFile, name: "Restricted resumed", message: "Report resumed state",
-    });
-    assert.ok(Value.Check(Type.Object({ launchScriptFile: Type.String() }), resumed.details));
-    const resumedDelivered = runtime.nextMessage();
-    execFileSync("bash", [resumed.details.launchScriptFile], { env: { ...process.env, BASH_ENV: fakePi } });
-    await resumedDelivered;
-    const last = findLastAssistantMessage(getBranchEntries(launched.details.sessionFile, 0));
-    assert.ok(last);
-    const Snapshot = Type.Object({
-      declaredTools: Type.Array(Type.String()), registeredTools: Type.Array(Type.String()),
-      systemPrompt: Type.String(), agentDir: Type.String(), cwd: Type.String(),
-    });
-    const fresh = Value.Decode(Snapshot, JSON.parse(first));
-    const afterResume = Value.Decode(Snapshot, JSON.parse(last));
-    const artifacts = join(import.meta.dirname, "artifacts", "resume-restrictions");
-    mkdirSync(artifacts, { recursive: true });
-    writeFileSync(join(artifacts, "receipt.json"), JSON.stringify({ fresh, afterResume, paidRequests: 0 }, null, 2));
-    assert.equal(afterResume.cwd, fresh.cwd);
-    assert.deepEqual(afterResume.declaredTools, fresh.declaredTools);
-    assert.deepEqual(afterResume.registeredTools, fresh.registeredTools);
-    assert.equal(afterResume.agentDir, fresh.agentDir);
-    assert.match(afterResume.systemPrompt, /ROLE_INSTRUCTION_FROM_LAUNCH/);
-  });
+  }
 
   it("rejects a Pi-only exit override for a Claude CLI launch before creating resources", async (t) => {
     const runtime = lifecycleRuntime();

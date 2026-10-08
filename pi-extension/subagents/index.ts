@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { keyHint } from "@mariozechner/pi-coding-agent";
+import { keyHint, SessionManager } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
@@ -43,6 +43,7 @@ import {
   getNewEntries,
   seedSubagentSessionFile,
 } from "./session.ts";
+import { launchPromptArgs, readLaunchSettings, requireLaunchResources, type LaunchSettings } from "./launch-settings.ts";
 import {
   type StatusSnapshot,
   type SubagentStatusState,
@@ -107,7 +108,7 @@ const SubagentParams = Type.Object({
     Type.String({ description: "Comma-separated skills (overrides agent default)" }),
   ),
   tools: Type.Optional(
-    Type.String({ description: "Comma-separated tools (overrides agent default)" }),
+    Type.String({ description: "Comma-separated initial tools for Pi-backed sessions (overrides agent default)" }),
   ),
   cwd: Type.Optional(
     Type.String({
@@ -570,14 +571,7 @@ function updateWidget() {
  */
 const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
 
-/**
- * Build the child --tools allowlist.
- *
- * Pi 0.70+ applies --tools to built-in, extension, and custom tools. If a
- * subagent definition restricts tools to e.g. "read,bash,write", the child
- * control tools from subagent-done.ts would otherwise be hidden, leaving a
- * manually resumed or user-touched subagent unable to call subagent_done.
- */
+/** Include completion controls in the child's initial tool selection. */
 function buildSubagentToolAllowlist(effectiveTools?: string): string | null {
   const requested = (effectiveTools ?? "")
     .split(",")
@@ -1022,6 +1016,7 @@ async function launchSubagent(
 
   if (!isConversation) parts.push(...buildModelArgs(effectiveModel, effectiveThinking).map(shellEscape));
   let conversationProfile: ConversationProfile | null = null;
+  let systemPrompt: LaunchSettings["systemPrompt"] = { mode: "none" };
 
   // Pass agent body as system prompt via file to avoid shell escaping issues
   // with multiline content. Pi's --append-system-prompt and --system-prompt
@@ -1045,16 +1040,18 @@ async function launchSubagent(
       };
       parts.push(...conversationArgs(conversationProfile).map(shellEscape));
     } else {
+      systemPrompt = { mode: systemPromptMode === "replace" ? "replace" : "append", path: syspromptPath };
       parts.push(flag, shellEscape(syspromptPath));
     }
   }
 
   const toolAllowlist = buildSubagentToolAllowlist(effectiveTools);
-  if (toolAllowlist) {
-    parts.push("--tools", shellEscape(toolAllowlist));
-  }
+  const launchSettings: LaunchSettings | null = isConversation ? null : {
+    cwd: targetCwdForSession, agentDir: effectiveAgentDir, agent: params.agent ?? null,
+    tools: toolAllowlist ? toolAllowlist.split(",") : null, deniedTools: [...denySet], systemPrompt,
+  };
 
-  // Build env prefix: denied tools + subagent identity + config dir propagation
+  // Build env prefix: resolved launch settings, subagent identity, and config directory.
   const envParts: string[] = [];
 
   // If the target cwd has its own .pi/agent/, use that as the config root.
@@ -1065,21 +1062,15 @@ async function launchSubagent(
     envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
   }
 
-  if (denySet.size > 0) {
-    envParts.push(`PI_DENY_TOOLS=${shellEscape([...denySet].join(","))}`);
-  }
+  envParts.push(`PI_SUBAGENT_LAUNCH_SETTINGS=${shellEscape(launchSettings ? JSON.stringify(launchSettings) : "")}`);
   envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
-  if (params.agent) {
-    envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
-  }
+  envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent ?? "")}`);
   envParts.push(`PI_SUBAGENT_AUTO_EXIT=${effectiveAutoExit ? "1" : "0"}`);
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
   envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
-  if (conversationProfile) {
-    envParts.push(`PI_SUBAGENT_CONVERSATION_PROFILE=${shellEscape(JSON.stringify(conversationProfile))}`);
-  }
+  envParts.push(`PI_SUBAGENT_CONVERSATION_PROFILE=${shellEscape(conversationProfile ? JSON.stringify(conversationProfile) : "")}`);
   const envPrefix = envParts.join(" ") + " ";
 
   // Pass task and skill prompts to the sub-agent.
@@ -1407,18 +1398,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     }
   });
 
-  // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
-  const deniedTools = new Set(
-    (process.env.PI_DENY_TOOLS ?? "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean),
-  );
-
-  const shouldRegister = (name: string) => !deniedTools.has(name);
-
   // ── subagent tool ──
-  if (shouldRegister("subagent"))
     pi.registerTool({
       name: "subagent",
       label: "Subagent",
@@ -1571,7 +1551,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     });
 
   // ── subagent_interrupt tool ──
-  if (shouldRegister("subagent_interrupt"))
     pi.registerTool({
       name: "subagent_interrupt",
       label: "Interrupt Subagent",
@@ -1623,7 +1602,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     });
 
   // ── subagents_list tool ──
-  if (shouldRegister("subagents_list"))
     pi.registerTool({
       name: "subagents_list",
       label: "List Subagents",
@@ -1686,7 +1664,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 
   // ── subagent_resume tool ──
-  if (shouldRegister("subagent_resume"))
     pi.registerTool({
       name: "subagent_resume",
       label: "Resume Subagent",
@@ -1788,6 +1765,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const entriesBefore = getNewEntries(sessionPath, 0);
           const entryCountBefore = entriesBefore.length;
           const conversationProfile = readConversationProfile(entriesBefore);
+          const resumeSession = SessionManager.open(sessionPath);
+          const launchSettings = readLaunchSettings(resumeSession.getBranch(), resumeSession.getSessionId());
+          if (launchSettings) requireLaunchResources(launchSettings);
           if (conversationProfile && !existsSync(conversationProfile.systemPromptPath)) {
             throw new Error(`Conversation system prompt is missing: ${conversationProfile.systemPromptPath}`);
           }
@@ -1802,6 +1782,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
           parts.push("-e", shellEscape(subagentDonePath));
           parts.push(...buildResumeArgs(sessionPath, conversationProfile).map(shellEscape));
+          if (launchSettings) parts.push(...launchPromptArgs(launchSettings).map(shellEscape));
 
           const sessionId = ctx.sessionManager.getSessionId();
           const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
@@ -1830,10 +1811,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const resumeEnvParts: string[] = [];
           if (conversationProfile) {
             resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(conversationProfile.agentDir)}`);
-            resumeEnvParts.push(`PI_SUBAGENT_CONVERSATION_PROFILE=${shellEscape(JSON.stringify(conversationProfile))}`);
+          } else if (launchSettings) {
+            resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(launchSettings.agentDir)}`);
           } else if (process.env.PI_CODING_AGENT_DIR) {
             resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
           }
+          resumeEnvParts.push(`PI_SUBAGENT_LAUNCH_SETTINGS=${shellEscape(launchSettings ? JSON.stringify(launchSettings) : "")}`);
+          resumeEnvParts.push(`PI_SUBAGENT_CONVERSATION_PROFILE=${shellEscape(conversationProfile ? JSON.stringify(conversationProfile) : "")}`);
+          resumeEnvParts.push(`PI_SUBAGENT_AGENT=${shellEscape(launchSettings?.agent ?? "")}`);
           resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
           resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(sessionPath)}`);
           resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
@@ -1841,7 +1826,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=${autoExit ? "1" : "0"}`);
           const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
-          const cdPrefix = conversationProfile ? `cd ${shellEscape(conversationProfile.cwd)} && ` : "";
+          const resumeCwd = conversationProfile?.cwd ?? launchSettings?.cwd;
+          const cdPrefix = resumeCwd ? `cd ${shellEscape(resumeCwd)} && ` : "";
           const { command, stderrFile } = buildPiLaunchCommand(`${cdPrefix}${resumeEnvPrefix}${parts.join(" ")}`, artifactDir, id);
           const launchScriptFile = join(
             artifactDir,

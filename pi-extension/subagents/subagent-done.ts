@@ -10,9 +10,10 @@ import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
 import { parseConversationProfile } from "./conversation-profile.ts";
 import { installSubagentModelGuard } from "./model-guard.ts";
+import { parseLaunchSettings, readLaunchSettings, type LaunchSettings } from "./launch-settings.ts";
 
 // Auto-exit requires Pi's agent_settled event, absent from the pinned SDK typings.
-type SubagentExtensionAPI = Pick<ExtensionAPI, "on" | "registerTool" | "registerShortcut" | "getAllTools" | "appendEntry"> & {
+type SubagentExtensionAPI = Pick<ExtensionAPI, "on" | "registerTool" | "registerShortcut" | "getAllTools" | "getActiveTools" | "setActiveTools" | "appendEntry"> & {
   on(event: "agent_settled", handler: (event: { type: "agent_settled" }, ctx: ExtensionContext) => void): void;
 };
 
@@ -98,13 +99,6 @@ export function findLatestAssistantError(
   return null;
 }
 
-export function parseDeniedTools(rawValue: string | undefined): string[] {
-  return (rawValue ?? "")
-    .split(",")
-    .map((value) => value.trim())
-    .filter(Boolean);
-}
-
 export default function (pi: SubagentExtensionAPI) {
   if (process.env.PI_SUBAGENT_SESSION) installSubagentModelGuard();
 
@@ -115,7 +109,9 @@ export default function (pi: SubagentExtensionAPI) {
   // Read subagent identity from env vars (set by parent orchestrator)
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
-  const deniedToolsValue = process.env.PI_DENY_TOOLS;
+  const launchJson = process.env.PI_SUBAGENT_LAUNCH_SETTINGS;
+  const initialLaunch = launchJson ? parseLaunchSettings(launchJson) : null;
+  let launchSettings: LaunchSettings | null = null;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
   const recorder = createSubagentActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
@@ -132,7 +128,7 @@ export default function (pi: SubagentExtensionAPI) {
         const agentTag = label ? theme.bold(theme.fg("accent", `[${label}]`)) : "";
 
         if (expanded) {
-          // Expanded: full tool list + denied
+          // Expanded: full tool list + initially disabled tools
           const countInfo = theme.fg("dim", ` — ${toolNames.length} available`);
           const hint = theme.fg("muted", "  (Ctrl+J to collapse)");
 
@@ -145,7 +141,7 @@ export default function (pi: SubagentExtensionAPI) {
             const deniedList = denied
               .map((name: string) => theme.fg("error", name))
               .join(theme.fg("muted", ", "));
-            deniedLine = "\n" + theme.fg("muted", "denied: ") + deniedList;
+            deniedLine = "\n" + theme.fg("muted", "initially disabled: ") + deniedList;
           }
 
           const content = new Text(
@@ -159,7 +155,7 @@ export default function (pi: SubagentExtensionAPI) {
           const countInfo = theme.fg("dim", ` — ${toolNames.length} tools`);
           const deniedInfo =
             denied.length > 0
-              ? theme.fg("dim", " · ") + theme.fg("error", `${denied.length} denied`)
+              ? theme.fg("dim", " · ") + theme.fg("error", `${denied.length} initially disabled`)
               : "";
           const hint = theme.fg("muted", "  (Ctrl+J to expand)");
 
@@ -193,10 +189,19 @@ export default function (pi: SubagentExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     const profileJson = process.env.PI_SUBAGENT_CONVERSATION_PROFILE;
     if (profileJson) pi.appendEntry("subagent-conversation", parseConversationProfile(profileJson));
+    const saved = initialLaunch ? readLaunchSettings(ctx.sessionManager.getBranch(), ctx.sessionManager.getSessionId()) : null;
+    const settings = saved ?? initialLaunch;
+    if (settings) {
+      if (!saved) {
+        pi.setActiveTools((settings.tools ?? pi.getActiveTools()).filter((name) => !settings.deniedTools.includes(name)));
+      }
+      launchSettings = { ...settings, cwd: ctx.cwd, tools: pi.getActiveTools() };
+      pi.appendEntry("subagent-launch", { ...launchSettings, sessionId: ctx.sessionManager.getSessionId() });
+    }
     recorder.sessionStart();
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
-    denied = parseDeniedTools(deniedToolsValue);
+    denied = launchSettings?.deniedTools.filter((name) => !pi.getActiveTools().includes(name)) ?? [];
 
     renderWidget(ctx, null);
   });
@@ -292,7 +297,12 @@ export default function (pi: SubagentExtensionAPI) {
     recorder.toolExecutionEnd((event as any).toolCallId, (event as any).toolName);
   });
 
-  pi.on("session_shutdown", (event) => {
+  pi.on("session_shutdown", (event, ctx) => {
+    if (launchSettings) {
+      pi.appendEntry("subagent-launch", {
+        ...launchSettings, tools: pi.getActiveTools(), sessionId: ctx.sessionManager.getSessionId(),
+      });
+    }
     const reason = (event as any).reason;
     recorder.sessionShutdown(reason);
 

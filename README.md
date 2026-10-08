@@ -272,6 +272,8 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 
 Results use the session's selected conversation branch. For resumed children, the returned answer must have been added after resume; if the selected branch has no new answer, the parent receives the exit status instead.
 
+For ordinary Pi-backed children, `subagent_resume` restores the recorded working directory, directory for agent configuration, file containing role instructions, and active tool selection. The operator's later tool selection takes precedence over the definition's initial selection. Keep the original directories and any generated system-prompt file available; missing required resources cause an error before a pane opens.
+
 **Interaction flow:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`
 2. Child session exits (like `subagent_done`)
@@ -358,11 +360,11 @@ Use YAML scalar values for the fields below. Null values, arrays, and mappings p
 | `thinking`    | string  | Explicit thinking level, including `off`; passed through `--thinking` so it overrides a model suffix |
 | `system-prompt` | string | `append` adds the definition body to the system prompt; `replace` replaces the default preamble. Context files and appendices are separate resources. |
 | `profile` | string | `conversation` runs a fresh, tool-free Pi session with only the supplied role instructions and input |
-| `tools`       | string  | Comma-separated **native pi tools only**: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`                                                                                                                                                                             |
+| `tools` | string | Initial comma-separated tool selection for Pi-backed sessions; completion controls are included |
 | `skills`      | string  | Comma-separated skill names to auto-load                                                                                                                                                                                                                                    |
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
-| `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
-| `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
+| `spawning` | boolean | Set `false` to disable all subagent lifecycle tools initially |
+| `deny-tools` | string | Comma-separated tool names to disable initially |
 | `auto-exit`   | boolean | Pi-backed sessions: exit after Pi settles and deliver the result automatically. Overridden by the tool's `autoExit` argument. Interrupted turns stay open. Also determines the derived `interactive` default. |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
@@ -468,9 +470,11 @@ subagent({ name: "Scout", agent: "scout", interactive: true, task: "..." });
 
 By default, every sub-agent can spawn further sub-agents. Control this with frontmatter:
 
+For Pi-backed children, these fields choose the initial active tools. The operator can enable or disable tools within the child session using a tool-selection control provided by an extension. PIS saves those selections immediately and restores them on resume. The active selection is also saved when the child quits or reloads.
+
 ### `spawning: false`
 
-Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`):
+Initially disables all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`):
 
 ```yaml
 ---
