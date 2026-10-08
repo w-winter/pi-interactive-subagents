@@ -270,6 +270,8 @@ The `caller_ping` tool lets a subagent request help from its parent agent. When 
 - `message` (optional): Follow-up prompt to send after resuming
 - `autoExit` (optional): Whether the resumed session should auto-exit after its next response. Defaults to `true` for autonomous follow-up work; set `false` when resuming for an interactive handoff.
 
+Results use the session's selected conversation branch. For resumed children, the returned answer must have been added after resume; if the selected branch has no new answer, the parent receives the exit status instead.
+
 **Interaction flow:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`
 2. Child session exits (like `subagent_done`)

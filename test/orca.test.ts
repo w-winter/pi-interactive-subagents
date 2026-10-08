@@ -10,6 +10,7 @@ import { Type } from "@sinclair/typebox";
 import subagentsExtension, { __test__ } from "../pi-extension/subagents/index.ts";
 import { createTestEnv, startPi } from "./integration/harness.ts";
 import { pollForExit } from "../pi-extension/subagents/completion.ts";
+import { findLastAssistantMessage, getBranchEntries } from "../pi-extension/subagents/session.ts";
 import {
   createSurface, getMuxBackend, sendCommand, sendEscape, readScreen,
   readScreenAsync, closeSurface, renameCurrentTab,
@@ -55,7 +56,7 @@ after(() => {
 
 type LifecycleRequest =
   | { name: string; task: string; cwd: string; agent?: string; autoExit?: boolean; interactive?: boolean; model?: string }
-  | { sessionPath: string; name?: string };
+  | { sessionPath: string; name?: string; message?: string };
 type LifecycleReason = "startup" | "reload" | "quit" | "new" | "resume" | "fork";
 type LifecycleHook = (event: { type: string; reason: LifecycleReason }, ctx: ExtensionContext) => void | Promise<void>;
 
@@ -144,7 +145,8 @@ describe("Parent lifecycle ownership", () => {
       const delivered = next.nextMessage();
       if (!resumed) writeFileSync(childSession, readFileSync(old.sessionFile, "utf8"));
       writeFileSync(childSession, readFileSync(childSession, "utf8") + JSON.stringify({
-        type: "message", message: { role: "assistant", content: [{ type: "text", text: "Result after reload" }] },
+        type: "message", id: "reload-answer", parentId: "thinking",
+        message: { role: "assistant", content: [{ type: "text", text: "Result after reload" }] },
       }) + "\n", { flag: "w" });
       writeFileSync(`${childSession}.exit`, JSON.stringify({ type: "done" }));
       await next.event("session_start", "reload", old.ctx);
@@ -156,6 +158,44 @@ describe("Parent lifecycle ownership", () => {
       const artifacts = join(import.meta.dirname, "artifacts", "parent-lifecycle");
       mkdirSync(artifacts, { recursive: true });
       writeFileSync(join(artifacts, `reload-${resumed}.json`), JSON.stringify({ launched, result, calls: calls(), paidRequests: 0 }, null, 2));
+    });
+  }
+
+  for (const mode of ["fresh", "resume", "resume-without-new-answer"] as const) {
+    it(`delivers only selected-branch output for ${mode}`, async (t) => {
+      process.env.ORCA_TEST_SCENARIO = "waiting";
+      process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+      const runtime = lifecycleRuntime();
+      t.after(() => runtime.event("session_shutdown", "quit"));
+      const answer = { type: "message", id: "selected", parentId: "thinking", message: {
+        role: "assistant", content: [{ type: "text", text: "Selected answer" }],
+      } };
+      if (mode === "resume-without-new-answer") {
+        writeFileSync(runtime.sessionFile, JSON.stringify(answer) + "\n", { flag: "a" });
+      }
+      const delivered = runtime.nextMessage();
+      const launched = await runtime.execute(mode === "fresh" ? "subagent" : "subagent_resume", mode === "fresh"
+        ? { name: "Branch child", task: "Wait", cwd: runtime.root }
+        : { name: "Branch child", sessionPath: runtime.sessionFile });
+      const child = Array.from(__test__.runningSubagents.values()).find((entry) => entry.name === "Branch child");
+      assert.ok(child);
+      if (mode === "fresh") writeFileSync(child.sessionFile, readFileSync(runtime.sessionFile));
+      const entries = [
+        ...(mode === "resume-without-new-answer" ? [] : [answer]),
+        { ...answer, id: "abandoned", parentId: "selected", message: {
+          role: "assistant", content: [{ type: "text", text: "Abandoned answer" }],
+        } },
+        { type: "session_info", id: "selection", parentId: "selected", name: "Selected branch" },
+      ];
+      writeFileSync(child.sessionFile, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n", { flag: "a" });
+      writeFileSync(`${child.sessionFile}.exit`, JSON.stringify({ type: "done" }));
+      const result = await delivered;
+      assert.match(JSON.stringify(result.content), mode === "resume-without-new-answer" ? /without new output/ : /Selected answer/);
+      assert.doesNotMatch(JSON.stringify(result.content), /Abandoned answer/);
+      assert.equal(runtime.messages.length, 1);
+      const artifacts = join(import.meta.dirname, "artifacts", "branch-result");
+      mkdirSync(artifacts, { recursive: true });
+      writeFileSync(join(artifacts, `${mode}-delivery.json`), JSON.stringify({ launched, result, paidRequests: 0 }, null, 2));
     });
   }
 
@@ -362,6 +402,59 @@ describe("Fresh Pi completion policy", () => {
     const artifacts = join(import.meta.dirname, "artifacts", "bare-completion");
     mkdirSync(artifacts, { recursive: true });
     writeFileSync(join(artifacts, "settled-result.json"), JSON.stringify({ launched, result, output, notifications: runtime.messages.length, paidRequests: 0 }, null, 2));
+  });
+
+  it("preserves the ordinary child's launch contract through resume", async (t) => {
+    const runtime = lifecycleRuntime();
+    t.after(() => runtime.event("session_shutdown", "quit"));
+    process.env.ORCA_TEST_SCENARIO = "waiting";
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+    const agentDir = join(runtime.root, "config");
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    mkdirSync(join(agentDir, "agents"), { recursive: true });
+    writeFileSync(join(agentDir, "agents", "restricted.md"), [
+      "---", "extension: pi-interactive-subagents", "model: launch-audit/snapshot",
+      "tools: read", "spawning: false", "deny-tools: subagent_interrupt,subagents_list",
+      "system-prompt: append", "---", "ROLE_INSTRUCTION_FROM_LAUNCH",
+    ].join("\n"));
+    const provider = join(import.meta.dirname, "fixtures", "launch-audit-provider.ts");
+    const extension = join(import.meta.dirname, "..", "pi-extension", "subagents", "index.ts");
+    const fakePi = join(runtime.root, "offline-pi.bash");
+    writeFileSync(fakePi, `function /opt/homebrew/bin/pi() { command /opt/homebrew/bin/pi --mode json --offline --no-extensions --no-skills --no-context-files -e '${provider}' -e '${extension}' "$@"; }\n`);
+    const launched = await runtime.execute("subagent", {
+      name: "Restricted", agent: "restricted", task: "Report launch state", cwd: runtime.root, autoExit: true,
+    });
+    const paths = Type.Object({ launchScriptFile: Type.String(), sessionFile: Type.String() });
+    assert.ok(Value.Check(paths, launched.details));
+    const freshDelivered = runtime.nextMessage();
+    execFileSync("bash", [launched.details.launchScriptFile], { env: { ...process.env, BASH_ENV: fakePi } });
+    await freshDelivered;
+    const first = findLastAssistantMessage(getBranchEntries(launched.details.sessionFile, 0));
+    assert.ok(first);
+    process.env.PI_CODING_AGENT_DIR = join(runtime.root, "different-config");
+    const resumed = await runtime.execute("subagent_resume", {
+      sessionPath: launched.details.sessionFile, name: "Restricted resumed", message: "Report resumed state",
+    });
+    assert.ok(Value.Check(Type.Object({ launchScriptFile: Type.String() }), resumed.details));
+    const resumedDelivered = runtime.nextMessage();
+    execFileSync("bash", [resumed.details.launchScriptFile], { env: { ...process.env, BASH_ENV: fakePi } });
+    await resumedDelivered;
+    const last = findLastAssistantMessage(getBranchEntries(launched.details.sessionFile, 0));
+    assert.ok(last);
+    const Snapshot = Type.Object({
+      declaredTools: Type.Array(Type.String()), registeredTools: Type.Array(Type.String()),
+      systemPrompt: Type.String(), agentDir: Type.String(), cwd: Type.String(),
+    });
+    const fresh = Value.Decode(Snapshot, JSON.parse(first));
+    const afterResume = Value.Decode(Snapshot, JSON.parse(last));
+    const artifacts = join(import.meta.dirname, "artifacts", "resume-restrictions");
+    mkdirSync(artifacts, { recursive: true });
+    writeFileSync(join(artifacts, "receipt.json"), JSON.stringify({ fresh, afterResume, paidRequests: 0 }, null, 2));
+    assert.equal(afterResume.cwd, fresh.cwd);
+    assert.deepEqual(afterResume.declaredTools, fresh.declaredTools);
+    assert.deepEqual(afterResume.registeredTools, fresh.registeredTools);
+    assert.equal(afterResume.agentDir, fresh.agentDir);
+    assert.match(afterResume.systemPrompt, /ROLE_INSTRUCTION_FROM_LAUNCH/);
   });
 
   it("rejects a Pi-only exit override for a Claude CLI launch before creating resources", async (t) => {

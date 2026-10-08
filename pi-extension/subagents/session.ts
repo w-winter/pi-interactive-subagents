@@ -1,6 +1,7 @@
 import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
+import { SessionManager } from "@mariozechner/pi-coding-agent";
 
 export interface SessionEntry {
   type: string;
@@ -90,6 +91,12 @@ export function getNewEntries(sessionFile: string, afterLine: number): SessionEn
   const raw = readFileSync(sessionFile, "utf8");
   const lines = raw.split("\n").filter((line) => line.trim());
   return lines.slice(afterLine).map((line) => JSON.parse(line) as SessionEntry);
+}
+
+/** Read selected-branch entries appended after the supplied physical entry count. */
+export function getBranchEntries(sessionFile: string, afterLine: number): SessionEntry[] {
+  const branchIds = new Set(SessionManager.open(sessionFile).getBranch().map((entry) => entry.id));
+  return getNewEntries(sessionFile, afterLine).filter((entry) => branchIds.has(entry.id));
 }
 
 /**

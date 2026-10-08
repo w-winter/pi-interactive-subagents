@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { RpcClient } from "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.js";
-import { findLastAssistantMessage, getNewEntries } from "../pi-extension/subagents/session.ts";
+import { findLastAssistantMessage, getBranchEntries } from "../pi-extension/subagents/session.ts";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 
@@ -54,7 +54,7 @@ test("PIS extracts the selected branch's answer after native tree navigation", a
     await rpc.setSessionName("Selected first answer");
     await rpc.stop();
 
-    const actual = findLastAssistantMessage(getNewEntries(sessionPath, 0));
+    const actual = findLastAssistantMessage(getBranchEntries(sessionPath, 0));
     const artifacts = join(root, "test/artifacts/branch-result");
     mkdirSync(artifacts, { recursive: true });
     writeFileSync(join(artifacts, "session.jsonl"), readFileSync(sessionPath));

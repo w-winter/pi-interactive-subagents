@@ -39,6 +39,7 @@ import {
 
 import {
   findLastAssistantMessage,
+  getBranchEntries,
   getNewEntries,
   seedSubagentSessionFile,
 } from "./session.ts";
@@ -1263,7 +1264,7 @@ async function watchSubagent(
     // Pi subagent result extraction
     let summary: string;
     if (existsSync(sessionFile)) {
-      const allEntries = getNewEntries(sessionFile, 0);
+      const allEntries = getBranchEntries(sessionFile, 0);
       summary =
         findLastAssistantMessage(allEntries) ??
         (result.errorMessage
@@ -1347,7 +1348,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return;
       }
       const summary = running.completion.kind === "resume"
-        ? resolveResumeSummary(getNewEntries(running.sessionFile, running.completion.entryCountBefore), result)
+        ? resolveResumeSummary(getBranchEntries(running.sessionFile, running.completion.entryCountBefore), result)
         : result.summary;
       pi.sendMessage({
         customType: "subagent_result",
