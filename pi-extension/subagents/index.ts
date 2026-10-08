@@ -120,10 +120,16 @@ const SubagentParams = Type.Object({
         "Force the full-context fork mode for this spawn. The sub-agent inherits the current session conversation, overriding any agent frontmatter session-mode.",
     }),
   ),
+  autoExit: Type.Optional(
+    Type.Boolean({
+      description:
+        "Set true to close the child and return its result after the final response, including any automatic retries and queued follow-ups. False leaves it open after replying. Defaults to the selected definition's auto-exit setting, or false if absent. Interrupted turns stay open. Not supported for definitions with cli: claude.",
+    }),
+  ),
   interactive: Type.Optional(
     Type.Boolean({
       description:
-        "Mark the subagent as interactive (long-running, user drives the conversation in its own pane). When true, the main session is not woken by status transitions (stalled/recovered) for this subagent. If omitted, falls back to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit` (agents that auto-exit are autonomous and get stall pings; agents that don't are interactive and stay quiet).",
+        "When true, suppress notifications about missing or restored activity updates from the child. Does not control exit or result delivery. Defaults to the selected definition's interactive setting, otherwise the opposite of autoExit.",
     }),
   ),
   resumeSessionId: Type.Optional(
@@ -236,29 +242,21 @@ function resolveLaunchBehavior(
   };
 }
 
-/**
- * Decide whether a subagent is interactive (user-driven, long-running).
- *
- * Resolution order:
- *   1. Explicit `interactive` tool parameter wins.
- *   2. Explicit `interactive` frontmatter field on the agent.
- *   3. Default: the inverse of `auto-exit`. Agents that auto-exit are
- *      autonomous (scout, worker, reviewer) and the parent session should be
- *      woken on stall/recovery transitions. Agents that don't auto-exit are
- *      driven by the user in their own pane (planner, iterate/fork) and
- *      stall pings are noise.
- *
- * When no agent defs exist at all (bare `subagent({ name, task })` call,
- * typical for `/iterate` with `fork: true`), `autoExit` is undefined and the
- * subagent is treated as interactive — matching the intent of iterate.
- */
+function resolveEffectiveAutoExit(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+): boolean {
+  return params.autoExit ?? agentDefs?.autoExit ?? false;
+}
+
+// Explicit notification settings take precedence over the effective exit policy.
 function resolveEffectiveInteractive(
   params: Static<typeof SubagentParams>,
   agentDefs: AgentDefaults | null,
 ): boolean {
   if (params.interactive != null) return params.interactive;
   if (agentDefs?.interactive != null) return agentDefs.interactive;
-  return !(agentDefs?.autoExit ?? false);
+  return !resolveEffectiveAutoExit(params, agentDefs);
 }
 
 function loadAgentDefaults(agentName: string): ListedAgentDefinition {
@@ -400,7 +398,10 @@ interface RunningSubagent {
     reason?: "missing" | "invalid" | "wrong-id";
     error?: string;
   };
-  completion: { kind: "fresh" } | { kind: "resume"; entryCountBefore: number };
+  completion:
+    | { kind: "fresh"; autoExit: boolean }
+    | { kind: "resume"; entryCountBefore: number }
+    | { kind: "claude" };
   cli?: string;
   sentinelFile?: string;
   statusState: SubagentStatusState;
@@ -866,10 +867,14 @@ async function launchSubagent(
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent === undefined ? null : loadAgentDefaults(params.agent);
+  if (agentDefs?.cli === "claude" && params.autoExit !== undefined) {
+    throw new Error("autoExit is only supported for Pi-backed subagents; this definition uses cli: claude");
+  }
   const effectiveModel = params.model ?? agentDefs?.model;
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
   const effectiveThinking = params.thinking ?? agentDefs?.thinking;
+  const effectiveAutoExit = resolveEffectiveAutoExit(params, agentDefs);
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
   const isConversation = agentDefs?.profile === "conversation";
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
@@ -992,7 +997,7 @@ async function launchSubagent(
       sessionFile: subagentSessionFile,
       launchScriptFile,
       cli: "claude",
-      completion: { kind: "fresh" },
+      completion: { kind: "claude" },
       sentinelFile,
       interactive: effectiveInteractive,
       statusState: createStatusState({
@@ -1066,7 +1071,7 @@ async function launchSubagent(
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
   }
-  envParts.push(`PI_SUBAGENT_AUTO_EXIT=${agentDefs?.autoExit ? "1" : "0"}`);
+  envParts.push(`PI_SUBAGENT_AUTO_EXIT=${effectiveAutoExit ? "1" : "0"}`);
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
@@ -1141,7 +1146,7 @@ async function launchSubagent(
     launchScriptFile,
     stderrFile,
     activityFile,
-    completion: { kind: "fresh" },
+    completion: { kind: "fresh", autoExit: effectiveAutoExit },
     interactive: effectiveInteractive,
     statusState: createStatusState({
       source: "pi",
@@ -1396,7 +1401,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     // Pi invalidates this extension API after shutdown; finish real deliveries first.
     await Promise.all(observers);
     if (reason !== "reload") runningSubagents.clear();
-    console.info(`[subagents:parent-lifecycle] ${JSON.stringify({ reason, retainedChildren: runningSubagents.size })}`);
+    if (runningSubagents.size) {
+      console.info(`[subagents:parent-lifecycle] ${JSON.stringify({ reason, retainedChildren: runningSubagents.size })}`);
+    }
   });
 
   // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
@@ -1415,19 +1422,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       name: "subagent",
       label: "Subagent",
       description:
-        "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+        "Delegate a task to a child agent in a separate terminal pane. Returns immediately with a launch acknowledgement; the result arrives later in this conversation and starts a new turn. " +
+        "Set autoExit: true to close the child and return its result after its final response. " +
+        "With automatic exit disabled, a reply leaves the session open; the child must call subagent_done or the user must close it to return a result. " +
+        "After launching, end your turn or do independent work. Do not poll for completion or assume a result before it arrives.",
       promptSnippet:
-        "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+        "Delegate a task to a child agent in a separate terminal pane. Returns immediately with a launch acknowledgement; the result arrives later in this conversation and starts a new turn. " +
+        "Set autoExit: true to close the child and return its result after its final response. " +
+        "With automatic exit disabled, a reply leaves the session open; the child must call subagent_done or the user must close it to return a result. " +
+        "After launching, end your turn or do independent work. Do not poll for completion or assume a result before it arrives.",
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1475,6 +1478,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         startStatusRefresh(pi);
         observeChild(running);
 
+        const completionInstruction = running.completion.kind === "fresh"
+          ? running.completion.autoExit
+            ? "Automatic exit is enabled: the child will return its result and close after its final response. "
+            : "Automatic exit is disabled: a completed reply leaves the session open. Results are delivered when the child calls subagent_done or the user closes that child session. "
+          : "The result will be delivered when the child session completes. ";
+        const details = {
+          id: running.id,
+          name: params.name,
+          task: params.task,
+          agent: params.agent,
+          sessionFile: running.sessionFile,
+          launchScriptFile: running.launchScriptFile,
+          stderrFile: running.stderrFile,
+          status: "started",
+        };
         // Return immediately
         return {
           content: [
@@ -1482,21 +1500,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               type: "text",
               text:
                 `Sub-agent "${params.name}" launched and is now running in the background. ` +
-                `Do NOT generate or assume any results — you have no idea what the sub-agent will do or produce. ` +
-                `The results will be delivered to you automatically as a steer message when the sub-agent finishes. ` +
-                `Until then, move on to other work or tell the user you're waiting.`,
+                completionInstruction +
+                `End your turn or do independent work until the result arrives.`,
             },
           ],
-          details: {
-            id: running.id,
-            name: params.name,
-            task: params.task,
-            agent: params.agent,
-            sessionFile: running.sessionFile,
-            launchScriptFile: running.launchScriptFile,
-            stderrFile: running.stderrFile,
-            status: "started",
-          },
+          details: running.completion.kind === "fresh"
+            ? { ...details, autoExit: running.completion.autoExit }
+            : details,
         };
       },
 

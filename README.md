@@ -148,7 +148,7 @@ The widget tracks each Pi-backed sub-agent from a child-written runtime snapshot
 
 These labels are no longer derived from session-file growth. Session JSONL is still used for transcript, resume, lineage, and result extraction, but Pi-backed liveness now comes from a small activity snapshot written by the child extension. A fixed internal watchdog marks a run as `stalled` when valid snapshots never appear, stop being readable, or stop matching the current child; valid long-running `active` or `waiting` states do not become `stalled` just because time passes. When a run enters `stalled` or recovers from it, the parent agent receives a steer message so it can react. All other status transitions stay in the widget only.
 
-**Interactive subagents stay silent.** Long-running user-driven subagents (e.g. `planner`, or any `/iterate` fork) do not wake the parent session on `stalled`/`recovered` transitions — the user is working directly in the subagent's pane, and a steer message there would just burn an orchestrator turn on a no-op "still waiting" ping. The widget still updates normally, and child snapshots are still recorded/classified regardless of the `interactive` setting. By default, agents with `auto-exit: true` are treated as autonomous and get stall pings; agents without it are treated as interactive and stay quiet. Override per-agent with `interactive: true|false` in frontmatter, or per-spawn with `interactive: true|false` on the tool call.
+**Interactive subagents stay silent.** Long-running user-driven subagents do not wake the parent session on `stalled`/`recovered` transitions. Their widgets and activity snapshots still update. The `interactive` tool argument takes precedence over the definition's `interactive` field; otherwise, it defaults to the inverse of the effective `autoExit` setting. Set `interactive: true` to suppress status notifications or `false` to receive them.
 
 #### Configuration
 
@@ -195,13 +195,31 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `inputFiles`           | string[] | omitted       | Absolute file paths attached to the initial prompt through Pi's `@file` handling |
 | `agent`                | string  | —              | Exact canonical name of an installed marked definition; omit for a bare launch |
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
-| `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
+| `autoExit`             | boolean | derived        | Pi-backed sessions: override the definition's `auto-exit`; defaults to `false` for bare launches. Set `true` to exit and deliver the result after Pi settles. |
+| `interactive`          | boolean | derived        | Suppress stall/recovery notifications when `true`. Defaults to the definition's `interactive` field, otherwise the inverse of effective `autoExit`. Controls notifications, not exit. |
 | `model`                | string  | —              | Override agent's default model                                                                    |
 | `thinking`             | string  | omitted        | Override agent's default thinking level, including `off` |
 | `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |
 | `cwd`                  | string  | —              | Working directory for the sub-agent (see [Role Folders](#role-folders))                           |
+
+### Automatic completion
+
+For a one-shot Pi child with no named role definition, set `autoExit: true`:
+
+```typescript
+subagent({
+  name: "Review",
+  task: "Review the attached source and return your findings.",
+  inputFiles: ["/absolute/path/to/source.md"],
+  autoExit: true,
+});
+```
+
+The child exits after Pi settles and delivers its final answer automatically, including when the task prohibits tool calls. The launch acknowledgement reports the effective exit policy, and its details include `autoExit` for Pi-backed children. When automatic exit is disabled, a completed reply leaves the session open; `subagent_done` or session closure delivers its result. Setting `interactive: false` enables status notifications but does not enable exit.
+
+The tool argument overrides a named definition's `auto-exit` in either direction, and it applies to Pi-backed models. Definitions that launch the standalone Claude CLI with `cli: claude` use their plugin's completion hook and reject the Pi-only `autoExit` argument.
 
 ### Launching by command
 
@@ -343,7 +361,7 @@ Use YAML scalar values for the fields below. Null values, arrays, and mappings p
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
 | `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
 | `deny-tools`  | string  | Comma-separated extension tool names to deny                                                                                                                                                                                                                                |
-| `auto-exit`   | boolean | Auto-shutdown when the agent finishes its turn — no `subagent_done` call needed. If the user sends any input, auto-exit is permanently disabled and the user takes over the session. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
+| `auto-exit`   | boolean | Pi-backed sessions: exit after Pi settles and deliver the result automatically. Overridden by the tool's `autoExit` argument. Interrupted turns stay open. Also determines the derived `interactive` default. |
 | `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from model-facing discovery such as `subagents_list`. It remains available by explicit name and in manual `/subagent` completion. |
@@ -394,7 +412,7 @@ Pass source documents using `inputFiles`, not paths that the model would need a 
 
 ### `auto-exit`
 
-Pi-backed children stay open after a response when `auto-exit` is false or omitted. Write role and completion instructions in the body of your agent definition or the task you pass to `subagent`. You can continue the conversation in the child's pane, use `subagent_done` to return its results, or close the session manually.
+The `auto-exit` definition field determines whether Pi-backed children exit automatically; the tool's `autoExit` argument overrides it. With automatic exit disabled, children stay open after a response. Write role and completion instructions in the body of your agent definition or the task you pass to `subagent`. You can continue the conversation in the child's pane, use `subagent_done` to return its results, or close the session manually.
 
 When set to `true`, the agent session shuts down automatically after Pi finishes the run, including automatic recovery and queued work. Auto-exit requires a Pi runtime that emits `agent_settled`.
 
@@ -420,7 +438,7 @@ auto-exit: true
 
 Controls whether status transitions (`stalled`, `recovered`) wake the parent session with a steer message.
 
-**Default:** the inverse of `auto-exit`. Autonomous agents (`auto-exit: true`) are non-interactive and ping the parent on stall/recovery; agents without `auto-exit` are interactive and stay quiet. Bare spawns with no agent defs (e.g. `/iterate` with `fork: true`) are treated as interactive.
+**Default:** the definition's explicit `interactive` field, otherwise the inverse of the effective exit policy. A bare launch defaults to interactive unless `autoExit: true` is supplied. The tool's `interactive` argument overrides these defaults and controls only notifications about stalls and recovery.
 
 **Why it exists:** Interactive agents can run for minutes or hours while the user thinks, types, and reads in the subagent's pane. Child snapshots still update the widget, but stalled/recovered supervision messages rarely need to wake the parent for user-driven sessions. Skipping the steer keeps the parent quiet until the child actually finishes.
 

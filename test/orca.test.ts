@@ -54,7 +54,7 @@ after(() => {
 });
 
 type LifecycleRequest =
-  | { name: string; task: string; cwd: string; agent?: string }
+  | { name: string; task: string; cwd: string; agent?: string; autoExit?: boolean; interactive?: boolean; model?: string }
   | { sessionPath: string; name?: string };
 type LifecycleReason = "startup" | "reload" | "quit" | "new" | "resume" | "fork";
 type LifecycleHook = (event: { type: string; reason: LifecycleReason }, ctx: ExtensionContext) => void | Promise<void>;
@@ -108,6 +108,17 @@ function lifecycleRuntime(extension = subagentsExtension) {
 }
 
 describe("Parent lifecycle ownership", () => {
+  for (const reason of ["reload", "quit"] as const) {
+    it(`keeps ${reason} quiet when no children are retained`, async (t) => {
+      const logs: string[] = [];
+      t.mock.method(console, "info", (message: string) => { logs.push(message); });
+      const runtime = lifecycleRuntime();
+      await runtime.event("session_start", "startup");
+      await runtime.event("session_shutdown", reason);
+      assert.equal(logs.some((message) => message.startsWith("[subagents:parent-lifecycle]")), false);
+    });
+  }
+
   for (const resumed of [false, true]) {
     it(`reattaches a ${resumed ? "resumed" : "fresh"} child after module reload and delivers once`, { timeout: 5000 }, async (t) => {
       process.env.ORCA_TEST_SCENARIO = "waiting";
@@ -278,6 +289,99 @@ function fileTree(root: string): string[] {
       : [name];
   });
 }
+
+describe("Fresh Pi completion policy", () => {
+  it("applies per-call exit policy before definition defaults and keeps status notifications independent", async (t) => {
+    const runtime = lifecycleRuntime();
+    t.after(() => runtime.event("session_shutdown", "quit"));
+    process.env.ORCA_TEST_SCENARIO = "waiting";
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+    process.env.PI_CODING_AGENT_DIR = join(runtime.root, "config");
+    const agents = join(process.env.PI_CODING_AGENT_DIR, "agents");
+    mkdirSync(agents, { recursive: true });
+    for (const autoExit of [false, true]) {
+      writeFileSync(join(agents, `exit-${autoExit}.md`),
+        `---\nextension: pi-interactive-subagents\nauto-exit: ${autoExit}\n---\nReturn the answer.\n`);
+    }
+    const cases = [
+      { params: {}, expected: false },
+      { params: { interactive: false }, expected: false },
+      { params: { autoExit: true }, expected: true },
+      { params: { autoExit: false }, expected: false },
+      { params: { autoExit: true, interactive: true }, expected: true },
+      { params: { agent: "exit-true" }, expected: true },
+      { params: { agent: "exit-true", autoExit: false }, expected: false },
+      { params: { agent: "exit-false", autoExit: true }, expected: true },
+    ];
+    const receipts = [];
+    for (const [index, entry] of cases.entries()) {
+      const launched = await runtime.execute("subagent", {
+        name: `Exit policy ${index}`, task: "Return the answer", cwd: runtime.root, ...entry.params,
+      });
+      const paths = Type.Object({ launchScriptFile: Type.String(), autoExit: Type.Boolean() });
+      assert.ok(Value.Check(paths, launched.details));
+      assert.equal(launched.details.autoExit, entry.expected);
+      const command = readFileSync(launched.details.launchScriptFile, "utf8");
+      assert.match(command, new RegExp(`PI_SUBAGENT_AUTO_EXIT=${entry.expected ? "1" : "0"}`));
+      assert.match(JSON.stringify(launched.content), entry.expected
+        ? /Automatic exit is enabled/
+        : /Automatic exit is disabled.*completed reply leaves the session open/);
+      receipts.push({ params: entry.params, autoExit: launched.details.autoExit, acknowledgement: launched.content });
+    }
+    const artifacts = join(import.meta.dirname, "artifacts", "bare-completion");
+    mkdirSync(artifacts, { recursive: true });
+    writeFileSync(join(artifacts, "launch-policies.json"), JSON.stringify({ receipts, paidRequests: 0 }, null, 2));
+  });
+
+  it("delivers a bare tool-free child's settled answer once through the registered tool", { timeout: 5000 }, async (t) => {
+    const runtime = lifecycleRuntime();
+    t.after(() => runtime.event("session_shutdown", "quit"));
+    process.env.ORCA_TEST_SCENARIO = "waiting";
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+    process.env.PI_CODING_AGENT_DIR = join(runtime.root, "config");
+    const completed = runtime.nextMessage();
+    const launched = await runtime.execute("subagent", {
+      name: "Bare one-shot", task: "Return the answer without calling tools.", cwd: runtime.root,
+      model: "guard-test/astra", autoExit: true,
+    });
+    const paths = Type.Object({ launchScriptFile: Type.String(), sessionFile: Type.String() });
+    assert.ok(Value.Check(paths, launched.details));
+    const fakePi = join(runtime.root, "offline-pi.bash");
+    const provider = join(import.meta.dirname, "fixtures", "model-guard-provider.ts");
+    writeFileSync(fakePi, `function /opt/homebrew/bin/pi() { command /opt/homebrew/bin/pi --mode json --offline --no-extensions --no-skills --no-context-files --no-tools -e '${provider}' "$@"; }\n`);
+    const output = execFileSync("bash", [launched.details.launchScriptFile], {
+      encoding: "utf8", env: { ...process.env, BASH_ENV: fakePi },
+    });
+    assert.match(output, /__SUBAGENT_DONE_0__/);
+    assert.deepEqual(JSON.parse(readFileSync(`${launched.details.sessionFile}.exit`, "utf8")), { type: "done" });
+    const result = await completed;
+    assert.equal(result.customType, "subagent_result");
+    assert.match(JSON.stringify(result.content), /astra/);
+    await runtime.event("session_shutdown", "quit");
+    assert.equal(runtime.messages.length, 1);
+    const artifacts = join(import.meta.dirname, "artifacts", "bare-completion");
+    mkdirSync(artifacts, { recursive: true });
+    writeFileSync(join(artifacts, "settled-result.json"), JSON.stringify({ launched, result, output, notifications: runtime.messages.length, paidRequests: 0 }, null, 2));
+  });
+
+  it("rejects a Pi-only exit override for a Claude CLI launch before creating resources", async (t) => {
+    const runtime = lifecycleRuntime();
+    t.after(() => runtime.event("session_shutdown", "quit"));
+    process.env.ORCA_TEST_SCENARIO = "waiting";
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+    process.env.PI_CODING_AGENT_DIR = join(runtime.root, "config");
+    const agents = join(process.env.PI_CODING_AGENT_DIR, "agents");
+    mkdirSync(agents, { recursive: true });
+    writeFileSync(join(agents, "claude-cli.md"), "---\nextension: pi-interactive-subagents\ncli: claude\n---\nReturn the answer.\n");
+    const before = fileTree(runtime.root);
+    await assert.rejects(runtime.execute("subagent", {
+      name: "Unsupported policy", task: "Return the answer", cwd: runtime.root,
+      agent: "claude-cli", autoExit: false,
+    }), /autoExit.*Pi-backed/);
+    assert.deepEqual(fileTree(runtime.root), before);
+    assert.equal(calls().some((call) => Array.isArray(call) && ["create", "send"].includes(call[1])), false);
+  });
+});
 
 describe("Named launch membership", () => {
   const cases = [
