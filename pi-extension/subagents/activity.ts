@@ -1,8 +1,12 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { stripVTControlCharacters } from "node:util";
+import { Type, type Static } from "@sinclair/typebox";
+import { Value } from "@sinclair/typebox/value";
 
-export type SubagentActivityPhase = "starting" | "active" | "waiting" | "done";
+export type SubagentActivityPhase = "starting" | "active" | "blocked" | "waiting" | "done";
 export type SubagentActivityScope = "agent" | "turn" | "provider" | "streaming" | "tool";
+export type SubagentUIPromptKind = Static<typeof UIPrompt>["kind"];
 
 export type SubagentActivityEvent =
   | "session_start"
@@ -20,6 +24,8 @@ export type SubagentActivityEvent =
   | "tool_execution_update"
   | "tool_result"
   | "tool_execution_end"
+  | "ui_prompt_start"
+  | "ui_prompt_end"
   | "caller_ping"
   | "subagent_done"
   | "session_shutdown";
@@ -32,6 +38,7 @@ export interface SubagentActivityState {
   sequence: number;
   latestEvent: SubagentActivityEvent;
   phase: SubagentActivityPhase;
+  uiPrompt?: Static<typeof UIPrompt>;
   agentActive: boolean;
   turnActive: boolean;
   providerActive: boolean;
@@ -70,6 +77,8 @@ export interface SubagentActivityRecorder {
   toolExecutionUpdate(toolCallId?: string, toolName?: string): void;
   toolResult(toolCallId?: string, toolName?: string): void;
   toolExecutionEnd(toolCallId?: string, toolName?: string): void;
+  uiPromptStart(kind: SubagentUIPromptKind, title?: string): void;
+  uiPromptEnd(): void;
   callerPing(): void;
   subagentDone(): void;
   sessionShutdown(reason: SubagentShutdownReason): void;
@@ -77,7 +86,7 @@ export interface SubagentActivityRecorder {
 
 const ACTIVITY_UPDATE_THROTTLE_MS = 500;
 const MAX_WRITE_FAILURES = 3;
-const KNOWN_PHASES = new Set<SubagentActivityPhase>(["starting", "active", "waiting", "done"]);
+const KNOWN_PHASES = new Set<SubagentActivityPhase>(["starting", "active", "blocked", "waiting", "done"]);
 const KNOWN_SCOPES = new Set<SubagentActivityScope>(["agent", "turn", "provider", "streaming", "tool"]);
 const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
   "session_start",
@@ -95,11 +104,17 @@ const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
   "tool_execution_update",
   "tool_result",
   "tool_execution_end",
+  "ui_prompt_start",
+  "ui_prompt_end",
   "caller_ping",
   "subagent_done",
   "session_shutdown",
 ]);
 const MAX_ACTIVITY_STRING_LENGTH = 200;
+const UIPrompt = Type.Object({
+  kind: Type.Union([Type.Literal("select"), Type.Literal("confirm"), Type.Literal("input"), Type.Literal("editor"), Type.Literal("custom")]),
+  title: Type.Union([Type.String({ maxLength: MAX_ACTIVITY_STRING_LENGTH, pattern: "^[^\\r\\n]*$" }), Type.Null()]),
+});
 
 export function getSubagentActivityFile(artifactDir: string, runningChildId: string): string {
   return join(artifactDir, "subagent-activity", `${runningChildId}.json`);
@@ -155,6 +170,11 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
   }
   if (typeof object.phase !== "string" || !KNOWN_PHASES.has(object.phase as SubagentActivityPhase)) {
     return invalidActivity("unknown activity phase");
+  }
+  if (object.phase === "blocked") {
+    if (!Value.Check(UIPrompt, object.uiPrompt)) return invalidActivity("invalid blocked UI prompt");
+  } else if (object.uiPrompt != null) {
+    return invalidActivity("UI prompt requires blocked activity");
   }
   if (
     object.activeScope != null &&
@@ -239,6 +259,8 @@ function createNoopRecorder(): SubagentActivityRecorder {
     toolExecutionUpdate() {},
     toolResult() {},
     toolExecutionEnd() {},
+    uiPromptStart() {},
+    uiPromptEnd() {},
     callerPing() {},
     subagentDone() {},
     sessionShutdown() {},
@@ -288,7 +310,7 @@ function markActive(
   activity.phase = "active";
   activity.activeScope = scope;
   if (activity.activeSince == null || resetActiveSince) activity.activeSince = now;
-  delete activity.waitingSince;
+  if (!activity.uiPrompt) delete activity.waitingSince;
 }
 
 export function createSubagentActivityRecorder(params: {
@@ -372,6 +394,7 @@ export function createSubagentActivityRecorder(params: {
     activity.updatedAt = observedAt;
     activity.sequence += 1;
     update(activity, observedAt);
+    if (activity.uiPrompt) activity.phase = "blocked";
 
     if (flush === "immediate") flushNow();
     else scheduleFlush();
@@ -381,6 +404,7 @@ export function createSubagentActivityRecorder(params: {
     record(latestEvent, (current) => {
       current.phase = "done";
       clearActiveState(current);
+      delete current.uiPrompt;
       delete current.waitingSince;
     }, "immediate");
     disable();
@@ -391,6 +415,7 @@ export function createSubagentActivityRecorder(params: {
       record("session_start", (current) => {
         current.phase = "starting";
         clearActiveState(current);
+        delete current.uiPrompt;
         delete current.waitingSince;
       }, "immediate");
     },
@@ -495,6 +520,24 @@ export function createSubagentActivityRecorder(params: {
         current.toolName = toolName ?? current.toolName;
         current.toolEndedAt = observedAt;
         refreshActiveScope(current);
+      }, "immediate");
+    },
+    uiPromptStart(kind, title) {
+      record("ui_prompt_start", (current, observedAt) => {
+        current.uiPrompt = { kind, title: title == null ? null
+          : stripVTControlCharacters(title).replace(/\s+/g, " ").trim().slice(0, MAX_ACTIVITY_STRING_LENGTH) };
+        current.waitingSince = observedAt;
+      }, "immediate");
+    },
+    uiPromptEnd() {
+      record("ui_prompt_end", (current, observedAt) => {
+        delete current.uiPrompt;
+        refreshActiveScope(current);
+        if (current.phase === "active") delete current.waitingSince;
+        else {
+          current.phase = "waiting";
+          current.waitingSince = observedAt;
+        }
       }, "immediate");
     },
     callerPing() {

@@ -6,7 +6,7 @@ https://github.com/user-attachments/assets/30adb156-cfb4-4c47-84ca-dd4aa80cba9f
 
 ## How It Works
 
-Call `subagent()` and it **returns immediately**. The sub-agent runs in its own terminal pane. A live widget above the input shows all running agents with their current state — `starting`, `active`, `waiting`, `stalled`, or `running`. When a sub-agent finishes, its result is **steered back** into the main session as an async notification — triggering a new turn so the agent can process it.
+Call `subagent()` and it **returns immediately**. The sub-agent runs in its own terminal pane. A live widget above the input shows all running agents with their current state: `starting`, `active`, `blocked`, `waiting`, `stalled`, or `running`. When a sub-agent finishes, its result is **steered back** into the main session as an async notification, triggering a new turn so the agent can process it.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -152,13 +152,16 @@ The widget tracks each Pi-backed sub-agent from a child-written runtime snapshot
 
 - `starting` — launched, but no valid child snapshot has been observed yet
 - `active` — the child is doing observed runtime work: agent turn, provider request, streaming, or tool execution
+- `blocked`: an extension dialog needs input in the child's pane; the widget shows its title or dialog kind
 - `waiting` — the child finished a turn and is intentionally open for more input or another stage
 - `stalled` — the parent has gone too long without a valid current child snapshot and can no longer trust the run is healthy
 - `running` — fallback for backends without child snapshots (e.g. Claude)
 
-These labels are no longer derived from session-file growth. Session JSONL is still used for transcript, resume, lineage, and result extraction, but Pi-backed liveness now comes from a small activity snapshot written by the child extension. A fixed internal watchdog marks a run as `stalled` when valid snapshots never appear, stop being readable, or stop matching the current child; valid long-running `active` or `waiting` states do not become `stalled` just because time passes. When a run enters `stalled` or recovers from it, the parent agent receives a steer message so it can react. All other status transitions stay in the widget only.
+Each Pi-backed child writes an activity snapshot for the parent widget. A fixed internal watchdog marks a run as `stalled` when valid snapshots never appear, stop being readable, or stop matching the current child. Valid `active`, `blocked`, and `waiting` states remain healthy regardless of their duration. Entering `blocked` or `stalled`, or recovering from `stalled`, sends a status notification to the parent for non-interactive children. Other status transitions update the widget.
 
-**Interactive subagents stay silent.** Long-running user-driven subagents do not wake the parent session on `stalled`/`recovered` transitions. Their widgets and activity snapshots still update. The `interactive` tool argument takes precedence over the definition's `interactive` field; otherwise, it defaults to the inverse of the effective `autoExit` setting. Set `interactive: true` to suppress status notifications or `false` to receive them.
+**Interactive subagents stay silent.** Long-running user-driven subagents update their widgets and activity snapshots while leaving the parent to its work. The `interactive` tool argument takes precedence over the definition's `interactive` field; otherwise, it defaults to the inverse of the effective `autoExit` setting. Set `interactive: true` to suppress status notifications or `false` to receive them.
+
+Pi 1.1 also reports `working`, `blocked`, `done`, `error`, and `idle` to terminals and dashboards that support OSC 7501. Set `PI_PROGRAM_STATUS=1` to force those terminal reports or `0` to disable them; see [Pi's terminal setup guide](https://github.com/earendil-works/pi/blob/v1.1.0/packages/coding-agent/docs/terminal-setup.md#program-status). PIS reads snapshots written by children to update its parent widget. Saved outcomes determine completion and recovery.
 
 #### Configuration
 
@@ -206,7 +209,7 @@ subagent({ name: "Designer", agent: "game-designer", cwd: "agents/game-designer"
 | `agent`                | string  | —              | Exact canonical name of an installed marked definition; omit for a bare launch |
 | `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
 | `autoExit`             | boolean | derived        | Pi-backed sessions: override the definition's `auto-exit`; defaults to `false` for bare launches. Set `true` to exit and deliver the result after Pi settles. |
-| `interactive`          | boolean | derived        | Suppress stall/recovery notifications when `true`. Defaults to the definition's `interactive` field, otherwise the inverse of effective `autoExit`. Controls notifications, not exit. |
+| `interactive`          | boolean | derived        | Suppress blocked/stall/recovery notifications when `true`. Defaults to the definition's `interactive` field, otherwise the inverse of effective `autoExit`. Controls notifications, not exit. |
 | `model`                | string  | —              | Override agent's default model                                                                    |
 | `thinking`             | string  | omitted        | Override agent's default thinking level, including `off` |
 | `systemPrompt`         | string  | —              | Append to system prompt                                                                           |
@@ -227,7 +230,7 @@ subagent({
 });
 ```
 
-The child exits after Pi settles and delivers its final answer automatically, including when the task prohibits tool calls. The launch acknowledgement reports the effective exit policy, and its details include `autoExit` for Pi-backed children. When automatic exit is disabled, a completed reply leaves the session open; `subagent_done` or session closure delivers its result. Setting `interactive: false` enables status notifications but does not enable exit.
+The child exits after Pi settles and delivers its final answer automatically, including when the task prohibits tool calls. A cancelled run stays open for another prompt, as reported by Pi's settlement event. The launch acknowledgement reports the effective exit policy, and its details include `autoExit` for Pi-backed children. When automatic exit is disabled, a completed reply leaves the session open; `subagent_done` or session closure delivers its result. Setting `interactive: false` enables status notifications but does not enable exit.
 
 The tool argument overrides a named definition's `auto-exit` in either direction, and it applies to Pi-backed models. Definitions that launch the standalone Claude CLI with `cli: claude` use their plugin's completion hook and reject the Pi-only `autoExit` argument.
 
@@ -376,7 +379,7 @@ Use YAML scalar values for the fields below. Null values, arrays, and mappings p
 | `spawning` | boolean | Set `false` to disable all subagent lifecycle tools initially |
 | `deny-tools` | string | Comma-separated tool names to disable initially |
 | `auto-exit`   | boolean | Pi-backed sessions: exit after Pi settles and deliver the result automatically. Overridden by the tool's `autoExit` argument. Interrupted turns stay open. Also determines the derived `interactive` default. |
-| `interactive` | boolean | derived        | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
+| `interactive` | boolean | derived        | Override whether blocked/stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and receive status notifications; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `cwd`         | string  | Default working directory (absolute or relative to project root)                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide this agent from model-facing discovery such as `subagents_list`. It remains available by explicit name and in manual `/subagent` completion. |
 
@@ -450,15 +453,15 @@ auto-exit: true
 
 ### `interactive`
 
-Controls whether status transitions (`stalled`, `recovered`) wake the parent session with a steer message.
+Controls whether status transitions (`blocked`, `stalled`, `recovered`) wake the parent session with a steer message.
 
-**Default:** the definition's explicit `interactive` field, otherwise the inverse of the effective exit policy. A bare launch defaults to interactive unless `autoExit: true` is supplied. The tool's `interactive` argument overrides these defaults and controls only notifications about stalls and recovery.
+**Default:** the definition's explicit `interactive` field, otherwise the inverse of the effective exit policy. A bare launch defaults to interactive unless `autoExit: true` is supplied. The tool's `interactive` argument overrides these defaults and controls notifications about blocked dialogs, stalls, and recovery.
 
-**Why it exists:** Interactive agents can run for minutes or hours while the user thinks, types, and reads in the subagent's pane. Child snapshots still update the widget, but stalled/recovered supervision messages rarely need to wake the parent for user-driven sessions. Skipping the steer keeps the parent quiet until the child actually finishes.
+**Why it exists:** Interactive agents can run for minutes or hours while the user thinks, types, and reads in the subagent's pane. The widget shows their status; completion and help requests notify the parent.
 
 **When to override:**
 
-- Set `interactive: false` on an agent that doesn't auto-exit but you still want stall pings for
+- Set `interactive: false` on an agent that doesn't auto-exit but needs parent attention for blocked dialogs or stalls
 - Set `interactive: true` on an autonomous agent you'd rather check on yourself
 
 ```yaml
@@ -564,7 +567,7 @@ Every sub-agent session displays a compact tools widget showing available and de
 
 ## Requirements
 
-- [pi](https://github.com/badlogic/pi-mono) — the coding agent
+- [Pi 1.1.0 or newer](https://github.com/earendil-works/pi), the coding agent
 - One supported multiplexer:
   - [cmux](https://github.com/manaflow-ai/cmux)
   - [tmux](https://github.com/tmux/tmux)

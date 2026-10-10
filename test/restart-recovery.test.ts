@@ -8,6 +8,9 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { ProjectTrustStore, RpcClient } from "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.js";
 import { decodeRun, readClaim, readOutcome } from "../pi-extension/subagents/run-records.ts";
+import { readSubagentActivityFile } from "../pi-extension/subagents/activity.ts";
+import { classifyStatus, createStatusState } from "../pi-extension/subagents/status.ts";
+import { __test__ } from "../pi-extension/subagents/index.ts";
 import { Type, type Static } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 
@@ -15,6 +18,8 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 // The private native PTY proof completes within this bound; a missing recovery must fail, not hang.
 const FIXTURE_WAIT_MS = 30_000;
 const FIXTURE_OBSERVATION_INTERVAL_MS = 20;
+// Twenty-millisecond progress updates keep the dialog open through two parent status refreshes.
+const FIXTURE_REPEATED_DIALOG_UPDATES = 120;
 const Actor = Type.Object({ pid: Type.Integer({ minimum: 1 }), ppid: Type.Integer({ minimum: 1 }) });
 const TerminalActor = Type.Object({ pid: Type.Integer({ minimum: 1 }), runnerPid: Type.Integer({ minimum: 1 }) });
 const CommonAck = Type.Object({ id: Type.String(), launchScriptFile: Type.String() });
@@ -392,6 +397,50 @@ test("failed child publication leaves its native session alive instead of claimi
     f.save("publication-failure", { ack, actor, outcomeClaimed: false });
   } finally { await f.cleanup(); }
 });
+
+for (const interactive of [false, true]) {
+  test(`a native child dialog reports blocked and respects interactive=${interactive}`, async () => {
+    const f = await fixture();
+    try {
+      const rpc = await f.open();
+      const ack = await f.launch(rpc, { task: "RECOVERY_DIALOG", autoExit: true, interactive });
+      const run = await latestRun(rpc);
+      assert.ok(run.launch.kind !== "claude" && run.launch.activityFile);
+      const activityFile = run.launch.activityFile;
+      writeFileSync(f.childRelease, "release");
+      await observeUntil(() => {
+        const read = readSubagentActivityFile(activityFile, ack.id);
+        return read.ok && read.activity.phase === "blocked";
+      }, "child must report its actual extension confirmation dialog");
+      const blocked = readSubagentActivityFile(activityFile, ack.id);
+      assert.ok(blocked.ok);
+      assert.equal(readOutcome(run), null, "a dialog is not a terminal outcome");
+      const running = { record: run, control: "recovered" as const, statusState: createStatusState({ source: "pi", startTimeMs: run.startTime }) };
+      __test__.observeRunningSubagent(running);
+      const snapshot = classifyStatus(running.statusState, Date.now());
+      assert.equal(snapshot.kind, "blocked");
+      assert.match(__test__.formatWidgetRightLabel(snapshot), /blocked.*Approve fixture action/);
+      await observeUntil(() => {
+        const read = readSubagentActivityFile(activityFile, ack.id);
+        return read.ok && read.activity.sequence >= blocked.activity.sequence + FIXTURE_REPEATED_DIALOG_UPDATES;
+      }, "concurrent tool progress must span multiple parent status refreshes");
+      const notices = await f.results(rpc, "subagent_status");
+      assert.equal(notices.length, interactive ? 0 : 1);
+      assert.ok(notices.every((notice) => notice.type === "custom_message" && Value.Check(Type.String(), notice.content) && /blocked.*Approve fixture action/.test(notice.content)));
+      writeFileSync(join(f.dir, "dismiss-dialog"), "dismiss");
+      await observeUntil(() => existsSync(join(f.dir, "dialog-dismissed")), "the dialog must dismiss through Pi's UI lifecycle");
+      await observeUntil(() => {
+        const read = readSubagentActivityFile(activityFile, ack.id);
+        return read.ok && read.activity.phase === "active";
+      }, "the unfinished tool must become active after the dialog closes");
+      assert.equal(readOutcome(run), null);
+      writeFileSync(join(f.dir, "finish-dialog-tool"), "finish");
+      await observeUntil(async () => (await f.results(rpc)).length === 1, "normal completion must still deliver");
+      assert.equal((await f.results(rpc, "subagent_status")).length, interactive ? 0 : 1);
+      f.save(`blocked-dialog-${interactive}`, { id: ack.id, snapshot, statusNotices: notices.length, results: 1 });
+    } finally { await f.cleanup(); }
+  });
+}
 
 test("a frozen child outcome survives later native history mutation and an orderly parent quit", async () => {
   const f = await fixture();

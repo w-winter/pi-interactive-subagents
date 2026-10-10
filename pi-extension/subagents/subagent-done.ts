@@ -9,44 +9,17 @@ import { Type } from "@sinclair/typebox";
 import { existsSync } from "node:fs";
 import { publishOutcome, readRunContext, type RunOutcome, type RunContext } from "./run-records.ts";
 import { findLastAssistantMessage, getBranchEntries, findLatestAssistantError, type SubagentErrorInfo } from "./session.ts";
-import { createSubagentActivityRecorder } from "./activity.ts";
+import { createSubagentActivityRecorder, type SubagentUIPromptKind } from "./activity.ts";
 import { parseConversationProfile } from "./conversation-profile.ts";
 import { installSubagentModelGuard } from "./model-guard.ts";
 import { parseLaunchSettings, readLaunchSettings, type LaunchSettings } from "./launch-settings.ts";
 
-// Auto-exit requires Pi's agent_settled event, absent from the pinned SDK typings.
+// Pi 1.1 lifecycle events are absent from the pinned SDK typings.
 type SubagentExtensionAPI = Pick<ExtensionAPI, "on" | "registerTool" | "registerShortcut" | "getAllTools" | "getActiveTools" | "setActiveTools" | "appendEntry"> & {
-  on(event: "agent_settled", handler: (event: { type: "agent_settled" }, ctx: ExtensionContext) => void): void;
+  on(event: "ui_prompt_start", handler: (event: { type: "ui_prompt_start"; kind: SubagentUIPromptKind; title?: string }, ctx: ExtensionContext) => void): void;
+  on(event: "ui_prompt_end", handler: (event: { type: "ui_prompt_end" }, ctx: ExtensionContext) => void): void;
+  on(event: "agent_settled", handler: (event: { type: "agent_settled"; aborted: boolean }, ctx: ExtensionContext) => void): void;
 };
-
-export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
-  return agentStarted;
-}
-
-export function shouldAutoExitOnSettled(
-  _userTookOver: boolean,
-  messages: any[] | undefined,
-): boolean {
-  // Manual input should not strand an auto-exit subagent. If the latest agent
-  // turn completed normally, close the session. Escape/abort still leaves it
-  // open for inspection or another prompt.
-  //
-  // stopReason: "error" (e.g. exhausted retries on a provider overload) also
-  // returns true — we want to shut down so the parent is woken up — but we
-  // pair this with findLatestAssistantError() so the parent learns it was an
-  // error, not a clean completion.
-  if (messages) {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i];
-      if (msg?.role === "assistant") {
-        return msg.stopReason !== "aborted";
-      }
-    }
-  }
-
-  return true;
-}
-
 
 type ChildExitSidecarPayload =
   | { type: "done" }
@@ -127,8 +100,6 @@ export default function (pi: SubagentExtensionAPI) {
     );
   }
 
-  let userTookOver = false;
-  let agentStarted = false;
   let outcomeClaimed = false;
   let completedMessages: AgentEndEvent["messages"] = [];
 
@@ -172,10 +143,6 @@ export default function (pi: SubagentExtensionAPI) {
 
   pi.on("input", () => {
     recorder.input();
-    // Ignore the initial task message that starts an autonomous subagent.
-    // Only inputs after the first agent run has started count as user takeover.
-    if (!shouldMarkUserTookOver(agentStarted)) return;
-    userTookOver = true;
   });
 
   pi.on("before_agent_start", () => {
@@ -183,7 +150,6 @@ export default function (pi: SubagentExtensionAPI) {
   });
 
   pi.on("agent_start", () => {
-    agentStarted = true;
     recorder.agentStart();
   });
 
@@ -191,8 +157,8 @@ export default function (pi: SubagentExtensionAPI) {
     completedMessages = event.messages;
   });
 
-  pi.on("agent_settled", (_event, ctx) => {
-    const shouldExit = context && autoExit && shouldAutoExitOnSettled(userTookOver, completedMessages);
+  pi.on("agent_settled", (event, ctx) => {
+    const shouldExit = context && autoExit && !event.aborted;
 
     if (shouldExit) {
       // The last low-level run may have failed before Pi completed recovery.
@@ -213,11 +179,14 @@ export default function (pi: SubagentExtensionAPI) {
     }
 
     recorder.agentEndWaiting();
-    if (autoExit) {
-      // Reset any recorded manual input marker. Auto-exit is decided by whether
-      // the latest agent turn completed normally, not by who initiated it.
-      userTookOver = false;
-    }
+  });
+
+  pi.on("ui_prompt_start", (event) => {
+    recorder.uiPromptStart(event.kind, event.title);
+  });
+
+  pi.on("ui_prompt_end", () => {
+    recorder.uiPromptEnd();
   });
 
   pi.on("turn_start", (event) => {

@@ -17,7 +17,7 @@ type CompletionMessage = { role: "assistant" } & (
 );
 type CompletionEvent =
   | { type: "agent_end"; messages: CompletionMessage[] }
-  | { type: "agent_settled" };
+  | { type: "agent_settled"; aborted: boolean };
 type CompletionHandler = (event: CompletionEvent, ctx: { shutdown(): void }) => void;
 
 function withChild(run: (emit: (event: CompletionEvent) => void, exit: string, shutdowns: () => number) => void) {
@@ -63,14 +63,14 @@ describe("settled child completion", () => {
     assert.equal(shutdowns(), 0);
     emit({ type: "agent_end", messages: [{ role: "assistant", stopReason: "stop" }] });
     assert.equal(existsSync(exit), false);
-    emit({ type: "agent_settled" });
+    emit({ type: "agent_settled", aborted: false });
     assert.equal(JSON.parse(readFileSync(exit, "utf8")).reason, "done");
     assert.equal(shutdowns(), 1);
   }));
 
   it("reports truncated output as a failure to the parent", () => withChild((emit, exit, shutdowns) => {
     emit({ type: "agent_end", messages: [{ role: "assistant", stopReason: "length", content: [{ type: "text", text: "Partial review" }] }] });
-    emit({ type: "agent_settled" });
+    emit({ type: "agent_settled", aborted: false });
     const payload = JSON.parse(readFileSync(exit, "utf8"));
     assert.equal(payload.reason, "error");
     assert.equal(payload.stopReason, "length");
@@ -85,13 +85,20 @@ describe("settled child completion", () => {
   }));
 
   it("leaves an interrupted session open and completes a later resumed turn", () => withChild((emit, exit, shutdowns) => {
-    emit({ type: "agent_end", messages: [{ role: "assistant", stopReason: "aborted" }] });
-    emit({ type: "agent_settled" });
+    emit({ type: "agent_end", messages: [{ role: "assistant", stopReason: "error", errorMessage: "This operation was aborted" }] });
+    emit({ type: "agent_settled", aborted: true });
     assert.equal(existsSync(exit), false);
     assert.equal(shutdowns(), 0);
     emit({ type: "agent_end", messages: [{ role: "assistant", stopReason: "stop" }] });
-    emit({ type: "agent_settled" });
+    emit({ type: "agent_settled", aborted: false });
     assert.equal(JSON.parse(readFileSync(exit, "utf8")).reason, "done");
+    assert.equal(shutdowns(), 1);
+  }));
+
+  it("reports an actual settled failure even when its text mentions an abort", () => withChild((emit, exit, shutdowns) => {
+    emit({ type: "agent_end", messages: [{ role: "assistant", stopReason: "error", errorMessage: "Remote operation aborted" }] });
+    emit({ type: "agent_settled", aborted: false });
+    assert.equal(JSON.parse(readFileSync(exit, "utf8")).reason, "error");
     assert.equal(shutdowns(), 1);
   }));
 });

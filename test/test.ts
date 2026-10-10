@@ -52,10 +52,7 @@ import {
   getSubagentActivityFile,
   readSubagentActivityFile,
 } from "../pi-extension/subagents/activity.ts";
-import subagentDoneExtension, {
-  shouldMarkUserTookOver,
-  shouldAutoExitOnSettled,
-} from "../pi-extension/subagents/subagent-done.ts";
+import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
 
 // --- Helpers ---
 
@@ -1203,41 +1200,6 @@ describe("subagent-done.ts", () => {
       } as any,
     };
   }
-
-  describe("shouldMarkUserTookOver", () => {
-    it("ignores the initial injected task before the first agent run", () => {
-      assert.equal(shouldMarkUserTookOver(false), false);
-    });
-
-    it("treats later input as manual takeover", () => {
-      assert.equal(shouldMarkUserTookOver(true), true);
-    });
-  });
-
-  describe("shouldAutoExitOnSettled", () => {
-    it("auto-exits after normal completion when there was no takeover", () => {
-      const messages = [{ role: "assistant", stopReason: "stop" }];
-      assert.equal(shouldAutoExitOnSettled(false, messages), true);
-    });
-
-    it("auto-exits after normal completion even when the user sent the prompt", () => {
-      const messages = [{ role: "assistant", stopReason: "stop" }];
-      assert.equal(shouldAutoExitOnSettled(true, messages), true);
-    });
-
-    it("stays open after Escape aborts the run", () => {
-      const messages = [{ role: "assistant", stopReason: "aborted" }];
-      assert.equal(shouldAutoExitOnSettled(false, messages), false);
-    });
-
-    it("still exits when the latest turn ended with stopReason=error", () => {
-      // Auto-exit subagents must shut down on retry-exhaustion errors so the
-      // parent is woken. The error sidecar (written separately) carries the
-      // failure detail; staying open would just strand the worker.
-      const messages = [{ role: "assistant", stopReason: "error", errorMessage: "529 overloaded" }];
-      assert.equal(shouldAutoExitOnSettled(false, messages), true);
-    });
-  });
 
   describe("findLatestAssistantError", () => {
     it("returns the error info from a stopReason=error message", () => {

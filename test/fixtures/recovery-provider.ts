@@ -26,6 +26,25 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("recovery-select", { description: "Select a private fixture branch",
     handler: (id, ctx) => ctx.navigateTree(id, { summarize: false }).then(() => {}) });
   pi.registerCommand("recovery-reload", { description: "Reload this isolated fixture", handler: (_args, ctx) => ctx.reload() });
+  pi.registerTool({
+    name: "recovery-dialog", label: "Recovery dialog", description: "Ask a private test confirmation",
+    parameters: Type.Object({}),
+    async execute(_id, _params, signal, onUpdate, ctx) {
+      const root = process.env.RECOVERY_FIXTURE_ROOT;
+      if (!root) throw new Error("Missing fixture dialog root");
+      const dialog = new AbortController();
+      const answer = ctx.ui.confirm("Approve fixture action", "Private test question", { signal: dialog.signal });
+      while (!existsSync(root + "/dismiss-dialog") && !signal?.aborted) {
+        onUpdate?.({ content: [{ type: "text", text: "Waiting for confirmation" }], details: {} });
+        await setTimeout(FIXTURE_GATE_INTERVAL_MS);
+      }
+      dialog.abort();
+      await answer;
+      writeFileSync(root + "/dialog-dismissed", "dismissed");
+      while (!existsSync(root + "/finish-dialog-tool") && !signal?.aborted) await setTimeout(FIXTURE_GATE_INTERVAL_MS);
+      return { content: [{ type: "text", text: "Dialog tool finished" }], details: {} };
+    },
+  });
   pi.registerProvider("recovery-test", {
     api: "openai-responses", apiKey: "fixture-only", baseUrl: "http://127.0.0.1:1",
     models: ["parent", "child"].map((id) => ({
@@ -55,11 +74,16 @@ export default function (pi: ExtensionAPI) {
           while (!existsSync(gate) && !options?.signal?.aborted) await setTimeout(FIXTURE_GATE_INTERVAL_MS);
         }
         if (options?.signal?.aborted) {
-          message.stopReason = "aborted";
-          stream.push({ type: "error", reason: "aborted", error: message });
+          message.stopReason = text.includes("RECOVERY_ABORT_AS_ERROR") ? "error" : "aborted";
+          message.errorMessage = "This operation was aborted";
+          stream.push({ type: "error", reason: message.stopReason, error: message });
         } else if (model.id === "parent" && text.startsWith("CALL ")) {
           const separator = text.indexOf(" ", 5);
           message.content = [{ type: "toolCall", id: "fixture-call", name: text.slice(5, separator), arguments: JSON.parse(text.slice(separator + 1)) }];
+          message.stopReason = "toolUse";
+          stream.push({ type: "done", reason: "toolUse", message });
+        } else if (model.id === "child" && text.includes("RECOVERY_DIALOG")) {
+          message.content = [{ type: "toolCall", id: "fixture-dialog", name: "recovery-dialog", arguments: {} }];
           message.stopReason = "toolUse";
           stream.push({ type: "done", reason: "toolUse", message });
         } else if (model.id === "child" && (text.includes("RECOVERY_EXPLICIT_DONE") || text.includes("RECOVERY_EXPLICIT_PING"))) {

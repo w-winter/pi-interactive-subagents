@@ -317,6 +317,10 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
     const duration = snapshot.activeDurationText ? ` ${snapshot.activeDurationText}` : "";
     return label ? ` active · ${label}${duration} ` : " active ";
   }
+  if (snapshot.kind === "blocked") {
+    const detail = snapshot.activityLabel ? ` · ${snapshot.activityLabel}` : "";
+    return ` blocked${detail} `;
+  }
   if (snapshot.kind === "waiting") {
     const duration = snapshot.waitingDurationText ? ` ${snapshot.waitingDurationText}` : "";
     const detail = snapshot.statusLabel ? ` · ${snapshot.statusLabel}` : "";
@@ -583,6 +587,7 @@ function buildPiPromptArgs(params: {
 }
 
 function activityLabel(activity: SubagentActivityState): string | undefined {
+  if (activity.uiPrompt) return activity.uiPrompt.title || activity.uiPrompt.kind;
   if (activity.phase !== "active") return undefined;
   if (activity.activeScope === "tool") return activity.toolName ?? "tool";
   if (activity.activeScope === "provider") return "provider";
@@ -736,10 +741,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
       }
       running.statusState = nextState;
 
-      // Interactive subagents (long-running, user-driven) intentionally don't
-      // wake the parent session on stalled/recovered transitions — the user is
-      // working in the subagent's pane, and a steer message here would burn an
-      // orchestrator turn on a no-op "still waiting" ping. Widget still updates.
+      // User-driven children update the widget without waking the parent.
       if (transition && !running.record.interactive) {
         transitionLines.push(formatTransitionLine(running.record.name, snapshot, transition));
       }

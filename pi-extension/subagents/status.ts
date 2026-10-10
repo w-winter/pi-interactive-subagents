@@ -11,11 +11,11 @@ const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_STATUS_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
 const STATUS_CONFIG_EXAMPLE_PATH = join(PACKAGE_ROOT, "config.json.example");
 
-export type SubagentStatusKind = "starting" | "active" | "waiting" | "stalled" | "running";
+export type SubagentStatusKind = "starting" | "active" | "blocked" | "waiting" | "stalled" | "running";
 export type SubagentStatusSource = "pi" | "claude";
-export type SubagentStatusTransition = "stalled" | "recovered" | null;
+export type SubagentStatusTransition = "blocked" | "stalled" | "recovered" | null;
 export type StatusSnapshotState = "unseen" | "present" | "missing" | "invalid" | "wrong-id";
-export type StatusActivityPhase = "starting" | "active" | "waiting" | "done";
+export type StatusActivityPhase = "starting" | "active" | "blocked" | "waiting" | "done";
 
 export interface StatusConfig {
   enabled: boolean;
@@ -259,11 +259,11 @@ export function observeStatus(
   if (blockedByLocalOverride) return state;
 
   const phase = observation.phase;
-  const activeNow = phase === "active" || observation.active === true;
+  const activeNow = phase !== "blocked" && (phase === "active" || observation.active === true);
   const activeSinceMs = activeNow
     ? observation.activeSince ?? state.activeSinceMs ?? updatedAt
     : null;
-  const waitingSinceMs = phase === "waiting"
+  const waitingSinceMs = phase === "waiting" || phase === "blocked"
     ? observation.waitingSince ?? state.waitingSinceMs ?? updatedAt
     : null;
 
@@ -326,7 +326,9 @@ function classifyProblemState(state: SubagentStatusState, now: number): Pick<Sta
   const problemMs = Math.max(0, now - problemSinceMs);
   if (problemMs >= SNAPSHOT_STALLED_AFTER_MS) return { kind: "stalled", statusLabel: problemLabel };
 
-  const lastHealthyKind = state.activeNow
+  const lastHealthyKind = state.phase === "blocked"
+    ? "blocked"
+    : state.activeNow
     ? "active"
     : state.waitingSinceMs != null || state.phase === "done"
       ? "waiting"
@@ -363,7 +365,9 @@ export function classifyStatus(state: SubagentStatusState, now: number): StatusS
   let statusLabel: string | null = null;
 
   if (state.snapshotState === "present") {
-    if (state.phase === "active" || state.activeNow) {
+    if (state.phase === "blocked") {
+      kind = "blocked";
+    } else if (state.phase === "active" || state.activeNow) {
       kind = "active";
     } else if (state.phase === "waiting") {
       kind = "waiting";
@@ -420,7 +424,9 @@ export function advanceStatusState(
 } {
   const snapshot = classifyStatus(state, now);
   const transition =
-    state.currentKind !== "stalled" && snapshot.kind === "stalled"
+    state.currentKind !== "blocked" && snapshot.kind === "blocked"
+      ? "blocked"
+      : state.currentKind !== "stalled" && snapshot.kind === "stalled"
       ? "stalled"
       : state.currentKind === "stalled" && (snapshot.kind === "active" || snapshot.kind === "waiting")
         ? "recovered"
@@ -468,6 +474,11 @@ export function formatStatusLine(name: string, snapshot: StatusSnapshot): string
 
   if (snapshot.kind === "active") {
     return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, ${formatActiveDetail(snapshot)}.`);
+  }
+
+  if (snapshot.kind === "blocked") {
+    const detail = snapshot.activityLabel ? ` (${snapshot.activityLabel})` : "";
+    return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, blocked${detail}; needs input in its pane.`);
   }
 
   if (snapshot.kind === "waiting") {
