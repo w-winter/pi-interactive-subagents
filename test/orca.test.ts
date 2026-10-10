@@ -1,7 +1,7 @@
 import { after, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext, ToolDefinition } from "@mariozechner/pi-coding-agent";
@@ -9,7 +9,9 @@ import { Value } from "@sinclair/typebox/value";
 import { Type } from "@sinclair/typebox";
 import subagentsExtension, { __test__ } from "../pi-extension/subagents/index.ts";
 import { createTestEnv, startPi } from "./integration/harness.ts";
-import { pollForExit } from "../pi-extension/subagents/completion.ts";
+import { captureOutput, publishOutcome, publishProcessClaim } from "../pi-extension/subagents/run-records.ts";
+import { SessionManager } from "@mariozechner/pi-coding-agent";
+import { ProjectTrustStore } from "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/index.js";
 import { findLastAssistantMessage, getBranchEntries } from "../pi-extension/subagents/session.ts";
 import {
   createSurface, getMuxBackend, sendCommand, sendEscape, readScreen,
@@ -28,6 +30,7 @@ const args = process.argv.slice(2);
 fs.appendFileSync(process.env.ORCA_TEST_LOG, JSON.stringify(args) + "\\n");
 const scenario = process.env.ORCA_TEST_SCENARIO;
 if (scenario === "cli-error") process.exit(1);
+if (scenario === "close-error" && args[1] === "close") process.exit(1);
 if (scenario === "invalid-json") { process.stdout.write("bad json"); process.exit(0); }
 let result;
 switch (args[1]) {
@@ -60,12 +63,13 @@ type LifecycleRequest =
 type LifecycleReason = "startup" | "reload" | "quit" | "new" | "resume" | "fork";
 type LifecycleHook = (event: { type: string; reason: LifecycleReason }, ctx: ExtensionContext) => void | Promise<void>;
 
-function lifecycleRuntime(extension = subagentsExtension) {
+function lifecycleRuntime(extension = subagentsExtension, failJournal = false) {
   const registered = new Map<string, (params: LifecycleRequest, ctx: ExtensionContext) => ReturnType<ToolDefinition["execute"]>>();
   const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
   const userMessages: string[] = [];
   const hooks = new Map<string, LifecycleHook>();
   const messages: Parameters<ExtensionAPI["sendMessage"]>[0][] = [];
+  const messageOptions: Parameters<ExtensionAPI["sendMessage"]>[1][] = [];
   let deliver: (message: Parameters<ExtensionAPI["sendMessage"]>[0]) => void = () => {};
   const api: Partial<ExtensionAPI> = {
     registerTool(tool) {
@@ -75,8 +79,12 @@ function lifecycleRuntime(extension = subagentsExtension) {
       });
     },
     registerCommand(name, command) { commands.set(name, command); }, registerMessageRenderer() {},
+    appendEntry(customType, data) {
+      if (failJournal) throw new Error("Fixture journal persistence failed");
+      SessionManager.open(sessionFile).appendCustomEntry(customType, data);
+    },
     sendUserMessage(message) { assert.ok(Value.Check(Type.String(), message)); userMessages.push(message); },
-    sendMessage(message) { messages.push(message); deliver(message); },
+    sendMessage(message, options) { messages.push(message); messageOptions.push(options); deliver(message); },
     getAllTools() { return []; },
   };
   // SAFETY: This double implements the registration and delivery APIs used by the lifecycle tests.
@@ -93,19 +101,38 @@ function lifecycleRuntime(extension = subagentsExtension) {
     getSessionFile: () => sessionFile, getSessionId: () => "parent", getSessionDir: () => root,
   } } as ExtensionContext;
   return {
-    root, sessionFile, ctx, messages, commands, userMessages,
+    root, sessionFile, ctx, messages, messageOptions, commands, userMessages,
     async event(event: string, reason: LifecycleReason, context = ctx) {
       const hook = hooks.get(event);
       assert.ok(hook);
       await hook({ type: event, reason }, context);
     },
     nextMessage: () => new Promise<Parameters<ExtensionAPI["sendMessage"]>[0]>((resolve) => { deliver = resolve; }),
-    async execute(name: string, params: LifecycleRequest) {
+    async execute(name: string, params: LifecycleRequest, context = ctx) {
       const tool = registered.get(name);
       assert.ok(tool);
-      return tool(params, ctx);
+      return tool(params, context);
     },
   };
+}
+
+function runPrivateScript(path: string, cwd: string, agentDir: string): void {
+  new ProjectTrustStore(agentDir).set(cwd, true);
+  execFileSync("uv", ["run", "--no-project", "--offline", "--python", "/usr/bin/python3",
+    join(import.meta.dirname, "fixtures/recovery-pty.py"), `bash '${path}'`,
+    join(cwd, "private-actor.json"), join(cwd, "private-output")], {
+    cwd, env: { ...process.env, PI_OFFLINE: "1", BASH_ENV: "", PI_SUBAGENT_SESSION: "", PI_SUBAGENT_RUN: "", PI_SUBAGENT_ID: "" },
+    timeout: 30000,
+  });
+}
+
+function completeChild(sessionFile: string, reason: "done" | "sentinel" = "done") {
+  const running = [...__test__.runningSubagents.values()].find((child) => child.record.launch.kind !== "claude" && child.record.launch.sessionFile === sessionFile);
+  assert.ok(running);
+  const actor = { pid: spawnSync("/usr/bin/true").pid, started: "reaped-fixture-process" };
+  publishProcessClaim(running.record, { kind: "claimed", id: running.record.id, executor: actor, supervisor: actor });
+  const common = { id: running.record.id, recordedAt: Date.now(), output: captureOutput(running.record) };
+  publishOutcome(running.record, reason === "sentinel" ? { ...common, reason, exitCode: 7 } : { ...common, reason });
 }
 
 describe("Parent lifecycle ownership", () => {
@@ -131,9 +158,10 @@ describe("Parent lifecycle ownership", () => {
       const launched = await old.execute(resumed ? "subagent_resume" : "subagent", resumed
         ? { name: "Reload child", sessionPath: old.sessionFile }
         : { name: "Reload child", task: "Wait", cwd: old.root });
-      const active = Array.from(__test__.runningSubagents.values()).find((child) => child.name === "Reload child");
+      const active = Array.from(__test__.runningSubagents.values()).find((child) => child.record.name === "Reload child");
       assert.ok(active);
-      const childSession = active.sessionFile;
+      assert.ok(active.record.launch.kind !== "claude");
+      const childSession = active.record.launch.sessionFile;
       await old.event("session_shutdown", "reload");
       assert.ok(!calls().some((call) => Array.isArray(call) && call[1] === "close"), "reload must not close the child");
       assert.deepEqual(old.messages, [], "observer detachment must not report cancellation");
@@ -148,7 +176,7 @@ describe("Parent lifecycle ownership", () => {
         type: "message", id: "reload-answer", parentId: "thinking",
         message: { role: "assistant", content: [{ type: "text", text: "Result after reload" }] },
       }) + "\n", { flag: "w" });
-      writeFileSync(`${childSession}.exit`, JSON.stringify({ type: "done" }));
+      completeChild(childSession);
       await next.event("session_start", "reload", old.ctx);
       const result = await delivered;
       assert.match(JSON.stringify(result.content), /Result after reload/);
@@ -177,9 +205,9 @@ describe("Parent lifecycle ownership", () => {
       const launched = await runtime.execute(mode === "fresh" ? "subagent" : "subagent_resume", mode === "fresh"
         ? { name: "Branch child", task: "Wait", cwd: runtime.root }
         : { name: "Branch child", sessionPath: runtime.sessionFile });
-      const child = Array.from(__test__.runningSubagents.values()).find((entry) => entry.name === "Branch child");
-      assert.ok(child);
-      if (mode === "fresh") writeFileSync(child.sessionFile, readFileSync(runtime.sessionFile));
+      const child = Array.from(__test__.runningSubagents.values()).find((entry) => entry.record.name === "Branch child");
+      assert.ok(child); assert.ok(child.record.launch.kind !== "claude");
+      if (mode === "fresh") writeFileSync(child.record.launch.sessionFile, readFileSync(runtime.sessionFile));
       const entries = [
         ...(mode === "resume-without-new-answer" ? [] : [answer]),
         { ...answer, id: "abandoned", parentId: "selected", message: {
@@ -187,8 +215,8 @@ describe("Parent lifecycle ownership", () => {
         } },
         { type: "session_info", id: "selection", parentId: "selected", name: "Selected branch" },
       ];
-      writeFileSync(child.sessionFile, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n", { flag: "a" });
-      writeFileSync(`${child.sessionFile}.exit`, JSON.stringify({ type: "done" }));
+      writeFileSync(child.record.launch.sessionFile, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n", { flag: "a" });
+      completeChild(child.record.launch.sessionFile);
       const result = await delivered;
       assert.match(JSON.stringify(result.content), mode === "resume-without-new-answer" ? /without new output/ : /Selected answer/);
       assert.doesNotMatch(JSON.stringify(result.content), /Abandoned answer/);
@@ -219,8 +247,8 @@ describe("Parent lifecycle ownership", () => {
     t.after(() => retry.event("session_shutdown", "quit"));
     process.env.ORCA_TEST_SCENARIO = "rejected";
     await assert.rejects(retry.execute("subagent_resume", { name: "Retry", sessionPath: retry.sessionFile }), /Orca returned/);
-    assert.equal(calls().filter((call) => Array.isArray(call) && call[1] === "close").length, 2,
-      "quit closes the first runner and failed startup closes its unused terminal");
+    assert.equal(calls().filter((call) => Array.isArray(call) && call[1] === "close").length, 1,
+      "failed startup closes its unused terminal; parent quit detaches");
     process.env.ORCA_TEST_SCENARIO = "waiting";
     const retried = await retry.execute("subagent_resume", { name: "Retry", sessionPath: retry.sessionFile });
     assert.match(JSON.stringify(retried.content), /resumed/);
@@ -233,31 +261,34 @@ describe("Parent lifecycle ownership", () => {
     const runtime = lifecycleRuntime();
     t.after(() => runtime.event("session_shutdown", "quit"));
     await runtime.execute("subagent", { name: "Fresh owner", task: "Wait", cwd: runtime.root });
-    const child = Array.from(__test__.runningSubagents.values()).find((entry) => entry.name === "Fresh owner");
-    assert.ok(child);
-    writeFileSync(child.sessionFile, readFileSync(runtime.sessionFile, "utf8"));
-    const duplicate = await runtime.execute("subagent_resume", { sessionPath: child.sessionFile });
+    const child = Array.from(__test__.runningSubagents.values()).find((entry) => entry.record.name === "Fresh owner");
+    assert.ok(child); assert.ok(child.record.launch.kind !== "claude");
+    writeFileSync(child.record.launch.sessionFile, readFileSync(runtime.sessionFile, "utf8"));
+    const duplicate = await runtime.execute("subagent_resume", { sessionPath: child.record.launch.sessionFile });
     assert.match(JSON.stringify(duplicate.content), /already running/);
     const completed = runtime.nextMessage();
-    writeFileSync(`${child.sessionFile}.exit`, JSON.stringify({ type: "done" }));
+    completeChild(child.record.launch.sessionFile);
     await completed;
-    const resumed = await runtime.execute("subagent_resume", { sessionPath: child.sessionFile });
+    const resumed = await runtime.execute("subagent_resume", { sessionPath: child.record.launch.sessionFile });
     assert.match(JSON.stringify(resumed.content), /resumed/);
   });
 
-  it("finishes a real completion during reload before invalidating the old delivery API", async () => {
+  it("retains completion during reload for the replacement owner", async (t) => {
     process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
-    process.env.PI_CODING_AGENT_DIR = join(directory, "racing-config");
-    const runtime = lifecycleRuntime();
-    await runtime.execute("subagent", { name: "Finishing child", task: "Wait", cwd: runtime.root });
-    await runtime.event("session_shutdown", "reload");
-    assert.equal(runtime.messages.length, 1);
-    assert.match(JSON.stringify(runtime.messages[0].content), /failed \(exit code 7\)/);
-    assert.match(JSON.stringify(runtime.messages[0].content), /Stderr:/);
-    assert.equal(__test__.runningSubagents.size, 0);
+    const old = lifecycleRuntime();
+    await old.execute("subagent", { name: "Finishing child", task: "Wait", cwd: old.root });
+    const child = [...__test__.runningSubagents.values()].find((entry) => entry.record.name === "Finishing child");
+    assert.ok(child); assert.ok(child.record.launch.kind !== "claude"); completeChild(child.record.launch.sessionFile, "sentinel");
+    await old.event("session_shutdown", "reload");
+    assert.equal(old.messages.length, 0);
+    const next = lifecycleRuntime();
+    t.after(() => next.event("session_shutdown", "quit", old.ctx));
+    await next.event("session_start", "reload", old.ctx);
+    assert.equal(next.messages.length, 1);
+    assert.match(JSON.stringify(next.messages[0].content), /failed \(exit code 7\)/);
   });
 
-  it("keeps Claude children across reload and still closes children on parent quit", async (t) => {
+  it("keeps Claude children across reload and detaches on parent quit", async (t) => {
     process.env.ORCA_TEST_SCENARIO = "waiting";
     process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
     process.env.PI_CODING_AGENT_DIR = join(directory, "claude-config");
@@ -273,8 +304,8 @@ describe("Parent lifecycle ownership", () => {
     t.after(() => next.event("session_shutdown", "quit"));
     await next.event("session_start", "reload", old.ctx);
     await next.event("session_shutdown", "quit");
-    assert.equal(next.messages.length, 1);
-    assert.ok(calls().some((call) => Array.isArray(call) && call[1] === "close"));
+    assert.equal(next.messages.length, 0);
+    assert.ok(!calls().some((call) => Array.isArray(call) && call[1] === "close"));
     assert.equal(__test__.runningSubagents.size, 0);
   });
 
@@ -290,21 +321,76 @@ describe("Parent lifecycle ownership", () => {
         : { name: "Crash", task: "Wait", cwd: runtime.root });
       const paths = Type.Object({ launchScriptFile: Type.String(), stderrFile: Type.String() });
       assert.ok(Value.Check(paths, launched.details), "launch must advertise a durable stderr path");
-      const fakePi = join(runtime.root, "fake-pi.bash");
-      // Bash resolves this function at the external executable boundary, leaving the generated script unchanged.
-      writeFileSync(fakePi, "function /opt/homebrew/bin/pi() { printf 'TUI output\\n'; printf 'fatal handler error\\n' >&2; return 7; }\n");
+      const fatalRoot = mkdtempSync(join(tmpdir(), "pis-fatal-cli-"));
+      t.after(() => execFileSync("trash", [fatalRoot]));
+      const failing = join(fatalRoot, "failing-cli");
+      writeFileSync(failing, "#!/bin/bash\nprintf 'TUI output\\n'\nprintf 'fatal handler error\\n' >&2\nexit 7\n", { mode: 0o755 });
+      const script = readFileSync(launched.details.launchScriptFile, "utf8").replace("/opt/homebrew/bin/pi", failing);
+      writeFileSync(launched.details.launchScriptFile, script);
+      const delivery = runtime.nextMessage();
       const output = execFileSync("bash", [launched.details.launchScriptFile], {
-        encoding: "utf8", env: { ...process.env, BASH_ENV: fakePi },
+        encoding: "utf8", env: { ...process.env, BASH_ENV: "" },
       });
       assert.match(output, /TUI output\n__SUBAGENT_DONE_7__/);
       assert.doesNotMatch(output, /fatal handler error/);
       assert.equal(readFileSync(launched.details.stderrFile, "utf8"), "fatal handler error\n");
       assert.equal(statSync(launched.details.stderrFile).mode & 0o777, 0o600);
+      const message = await delivery;
+      assert.match(JSON.stringify(message), /"exitCode":7/);
+      assert.deepEqual(runtime.messageOptions.at(-1), { triggerTurn: true, deliverAs: "steer" });
       const artifacts = join(import.meta.dirname, "artifacts", "parent-lifecycle");
       mkdirSync(artifacts, { recursive: true });
-      writeFileSync(join(artifacts, `stderr-${resumed}.json`), JSON.stringify({ output, stderr: readFileSync(launched.details.stderrFile, "utf8"), paidRequests: 0 }, null, 2));
+      writeFileSync(join(artifacts, `stderr-${resumed}.json`), JSON.stringify({ output, message, delivery: runtime.messageOptions.at(-1), stderr: readFileSync(launched.details.stderrFile, "utf8"), paidRequests: 0 }, null, 2));
     });
   }
+});
+
+describe("Launch and cleanup failure boundaries", () => {
+  it("initializes an unpersisted parent but refuses dispatch without a session file", async (t) => {
+    const runtime = lifecycleRuntime(); t.after(() => runtime.event("session_shutdown", "quit"));
+    // SAFETY: Only persistence is absent; the registration double supplies the remaining methods used by this tool.
+    const ctx = { ...runtime.ctx, sessionManager: { ...runtime.ctx.sessionManager, getSessionFile: () => undefined } } as ExtensionContext;
+    await runtime.event("session_start", "startup", ctx);
+    const result = await runtime.execute("subagent", { name: "Unpersisted", task: "Wait", cwd: runtime.root }, ctx);
+    assert.match(JSON.stringify(result), /no session file/i);
+    assert.equal(readFileSync(log, "utf8"), "");
+  });
+
+  it("journal failure closes only the unused pane and sends no command", async (t) => {
+    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+    const runtime = lifecycleRuntime(subagentsExtension, true); t.after(() => runtime.event("session_shutdown", "quit"));
+    await runtime.event("session_start", "startup");
+    await assert.rejects(runtime.execute("subagent", { name: "Journal", task: "Wait", cwd: runtime.root }), /journal persistence failed/);
+    const calls = readFileSync(log, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    assert.equal(calls.filter((args) => args[1] === "send").length, 0);
+    assert.equal(calls.filter((args) => args[1] === "close").length, 1);
+  });
+
+  it("shutdown during the existing shell wait prevents late dispatch", async (t) => {
+    delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+    const runtime = lifecycleRuntime(); t.after(() => runtime.event("session_shutdown", "quit"));
+    await runtime.event("session_start", "startup");
+    const launch = runtime.execute("subagent", { name: "Delayed", task: "Wait", cwd: runtime.root });
+    const rejection = assert.rejects(launch, /parent runtime has closed/);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await runtime.event("session_shutdown", "quit");
+    await rejection;
+    const calls = readFileSync(log, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    assert.equal(calls.filter((args) => args[1] === "send").length, 0);
+    assert.equal(calls.filter((args) => args[1] === "close").length, 1);
+  });
+
+  it("pane cleanup failure preserves the completed task message", async (t) => {
+    process.env.ORCA_TEST_SCENARIO = "waiting"; process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+    const runtime = lifecycleRuntime(); t.after(() => runtime.event("session_shutdown", "quit"));
+    await runtime.event("session_start", "startup");
+    const result = await runtime.execute("subagent", { name: "Cleanup", task: "Wait", cwd: runtime.root });
+    const details = Type.Object({ sessionFile: Type.String() }); assert.ok(Value.Check(details, result.details));
+    const delivery = runtime.nextMessage(); completeChild(result.details.sessionFile);
+    process.env.ORCA_TEST_SCENARIO = "close-error";
+    assert.match(JSON.stringify(await delivery), /completed/);
+    assert.equal(runtime.messages.length, 1);
+  });
 });
 
 beforeEach(() => {
@@ -373,37 +459,6 @@ describe("Fresh Pi completion policy", () => {
     writeFileSync(join(artifacts, "launch-policies.json"), JSON.stringify({ receipts, paidRequests: 0 }, null, 2));
   });
 
-  it("delivers a bare tool-free child's settled answer once through the registered tool", { timeout: 5000 }, async (t) => {
-    const runtime = lifecycleRuntime();
-    t.after(() => runtime.event("session_shutdown", "quit"));
-    process.env.ORCA_TEST_SCENARIO = "waiting";
-    process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
-    process.env.PI_CODING_AGENT_DIR = join(runtime.root, "config");
-    const completed = runtime.nextMessage();
-    const launched = await runtime.execute("subagent", {
-      name: "Bare one-shot", task: "Return the answer without calling tools.", cwd: runtime.root,
-      model: "guard-test/astra", autoExit: true,
-    });
-    const paths = Type.Object({ launchScriptFile: Type.String(), sessionFile: Type.String() });
-    assert.ok(Value.Check(paths, launched.details));
-    const fakePi = join(runtime.root, "offline-pi.bash");
-    const provider = join(import.meta.dirname, "fixtures", "model-guard-provider.ts");
-    writeFileSync(fakePi, `function /opt/homebrew/bin/pi() { command /opt/homebrew/bin/pi --mode json --offline --no-extensions --no-skills --no-context-files --no-tools -e '${provider}' "$@"; }\n`);
-    const output = execFileSync("bash", [launched.details.launchScriptFile], {
-      encoding: "utf8", env: { ...process.env, BASH_ENV: fakePi },
-    });
-    assert.match(output, /__SUBAGENT_DONE_0__/);
-    assert.deepEqual(JSON.parse(readFileSync(`${launched.details.sessionFile}.exit`, "utf8")), { type: "done" });
-    const result = await completed;
-    assert.equal(result.customType, "subagent_result");
-    assert.match(JSON.stringify(result.content), /astra/);
-    await runtime.event("session_shutdown", "quit");
-    assert.equal(runtime.messages.length, 1);
-    const artifacts = join(import.meta.dirname, "artifacts", "bare-completion");
-    mkdirSync(artifacts, { recursive: true });
-    writeFileSync(join(artifacts, "settled-result.json"), JSON.stringify({ launched, result, output, notifications: runtime.messages.length, paidRequests: 0 }, null, 2));
-  });
-
   for (const restrictions of [
     { name: "allowlist", fields: ["tools: read"] },
     { name: "spawning", fields: ["spawning: false"] },
@@ -427,16 +482,19 @@ describe("Fresh Pi completion policy", () => {
       ].join("\n"));
       const provider = join(import.meta.dirname, "fixtures", "launch-audit-provider.ts");
       const extension = join(import.meta.dirname, "..", "pi-extension", "subagents", "index.ts");
-      const fakePi = join(runtime.root, "offline-pi.bash");
-      writeFileSync(fakePi, `function /opt/homebrew/bin/pi() { command /opt/homebrew/bin/pi --mode json --offline --no-extensions --no-skills --no-context-files -e '${provider}' -e '${extension}' -e '/Users/ww/dot314/agent/extensions/tools/index.ts' "$@"; }\n`);
+      const privateExtensions = join(agentDir, "extensions");
+      symlinkSync(provider, join(privateExtensions, "provider.ts"));
+      writeFileSync(join(privateExtensions, "subagents.ts"), `export { default } from ${JSON.stringify(extension)};\n`);
+      writeFileSync(join(privateExtensions, "selector.ts"), 'export { default } from "/Users/ww/dot314/agent/extensions/tools/index.ts";\n');
       const launched = await runtime.execute("subagent", {
         name: "Restricted", agent: "restricted", task: "Report launch state", cwd: runtime.root, autoExit: true,
       });
-      const paths = Type.Object({ launchScriptFile: Type.String(), sessionFile: Type.String() });
+      const paths = Type.Object({ launchScriptFile: Type.String(), sessionFile: Type.String(), stderrFile: Type.String() });
       assert.ok(Value.Check(paths, launched.details));
       const freshDelivered = runtime.nextMessage();
-      execFileSync("bash", [launched.details.launchScriptFile], { env: { ...process.env, BASH_ENV: fakePi } });
+      runPrivateScript(launched.details.launchScriptFile, runtime.root, agentDir);
       await freshDelivered;
+      if (!existsSync(launched.details.sessionFile)) throw new Error("Native fixture startup failed: " + readFileSync(launched.details.stderrFile, "utf8").slice(-1800));
       const first = findLastAssistantMessage(getBranchEntries(launched.details.sessionFile, 0));
       assert.ok(first);
       writeFileSync(join(agentDir, "agents", "restricted.md"), "---\nextension: pi-interactive-subagents\n---\nEDITED_DEFINITION\n");
@@ -445,8 +503,11 @@ describe("Fresh Pi completion policy", () => {
         sessionPath: launched.details.sessionFile, name: "Restricted resumed", message: "Report resumed state",
       });
       assert.ok(Value.Check(Type.Object({ launchScriptFile: Type.String() }), resumed.details));
+      const resumedRun = [...__test__.runningSubagents.values()].find((entry) => entry.record.name === "Restricted resumed");
+      assert.ok(resumedRun);
+      assert.match(__test__.renderSubagentWidgetLines([resumedRun], 160).join("\n"), /Restricted resumed \(restricted\)/);
       const resumedDelivered = runtime.nextMessage();
-      execFileSync("bash", [resumed.details.launchScriptFile], { env: { ...process.env, BASH_ENV: fakePi } });
+      runPrivateScript(resumed.details.launchScriptFile, runtime.root, agentDir);
       await resumedDelivered;
       const last = findLastAssistantMessage(getBranchEntries(launched.details.sessionFile, 0));
       assert.ok(last);
@@ -641,9 +702,6 @@ describe("Orca backend", () => {
   it("reads rendered output through both APIs and detects the completion sentinel", async () => {
     assert.equal(readScreen("term_child", 5), "hello\n__SUBAGENT_DONE_7__");
     assert.equal(await readScreenAsync("term_child", 5), "hello\n__SUBAGENT_DONE_7__");
-    assert.deepEqual(await pollForExit("term_child", new AbortController().signal, { interval: 1 }), {
-      reason: "sentinel", exitCode: 7,
-    });
     for (const call of calls()) {
       assert.deepEqual(call, ["terminal", "read", "--terminal", "term_child", "--screen", "--limit", "5", "--json"]);
     }
@@ -674,56 +732,6 @@ describe("Orca backend", () => {
     assert.throws(() => sendCommand("term_child", "echo hi"), /Orca returned/);
   });
 
-  for (const scenario of ["closed-readable", "closed-unreadable"]) {
-    it(`settles ${scenario} terminals without a child exit file`, async () => {
-      process.env.ORCA_TEST_SCENARIO = scenario;
-      const controller = new AbortController();
-      const result = await pollForExit("term_child", controller.signal, {
-        interval: 1,
-        onTick: () => controller.abort(),
-      });
-      assert.deepEqual(result, { reason: "quit", exitCode: 0 });
-      closeSurface("term_child");
-      assert.ok(!calls().some((call) => Array.isArray(call) && call[1] === "close"));
-    });
-  }
-
-  for (const scenario of ["waiting", "stream", "probe-error"]) {
-    it(`keeps ${scenario} children tracked until closure is confirmed`, async () => {
-      process.env.ORCA_TEST_SCENARIO = scenario;
-      const controller = new AbortController();
-      let ticks = 0;
-      const result = await pollForExit("term_child", controller.signal, {
-        interval: 1,
-        onTick() {
-          if (++ticks > 1) controller.abort();
-          process.env.ORCA_TEST_SCENARIO = "closed-readable";
-        },
-      });
-      assert.equal(ticks, 1);
-      assert.deepEqual(result, { reason: "quit", exitCode: 0 });
-    });
-  }
-
-  it("honors completion written during the lifecycle query", async () => {
-    const sessionFile = join(directory, "late-completion.jsonl");
-    process.env.ORCA_TEST_SCENARIO = "closed-readable";
-    process.env.ORCA_TEST_EXIT = `${sessionFile}.exit`;
-    const controller = new AbortController();
-    assert.deepEqual(await pollForExit("term_child", controller.signal, {
-      interval: 1, sessionFile, onTick: () => controller.abort(),
-    }), { reason: "done", exitCode: 0 });
-  });
-
-  it("cancels completion polling after a read failure", async () => {
-    process.env.ORCA_TEST_SCENARIO = "stream";
-    const controller = new AbortController();
-    await assert.rejects(pollForExit("term_child", controller.signal, {
-      interval: 1,
-      onTick: () => controller.abort(),
-    }), { name: "AbortError" });
-  });
-
   it("reports closure and removes fresh, resumed, and Claude children from tracking", { timeout: 5000 }, async (t) => {
     type NamedChildRequest = { name: string };
     type Tool = {
@@ -734,6 +742,7 @@ describe("Orca backend", () => {
     let shutdown: () => void | Promise<void> = () => {};
     let deliver: (message: Message) => void = () => {};
     const api: Partial<ExtensionAPI> = {
+      appendEntry(customType, data) { SessionManager.open(sessionFile).appendCustomEntry(customType, data); },
       registerTool(tool) {
         tools.set(tool.name, {
           async execute(id, params, signal, update, ctx) {
@@ -814,7 +823,7 @@ describe("Orca backend", () => {
         const autoExit = entry.params.name === "Selected model child" ? "1" : "0";
         assert.ok(command.includes(`PI_SUBAGENT_AUTO_EXIT=${autoExit}`));
         if (entry.params.name === "Selected model child") {
-          assert.match(command, /'--model' 'fixture\/selected-model'/);
+          assert.match(command, /fixture\/selected-model/);
         }
       }
       if (entry.params.name === "Fresh child" || entry.params.name === "Interactive child") {

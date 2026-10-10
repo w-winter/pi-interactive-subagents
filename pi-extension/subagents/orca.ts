@@ -7,7 +7,7 @@ const execFileAsync = promisify(execFile);
 const Handle = Type.String({ minLength: 1 });
 const Parent = Type.Object({ terminal: Type.Object({ worktreeId: Handle, executionHostId: Type.Literal("local") }) });
 const Created = Type.Object({ terminal: Type.Object({ handle: Handle, surface: Type.String() }) });
-const Sent = Type.Object({ send: Type.Object({ accepted: Type.Literal(true) }) });
+const Sent = Type.Object({ send: Type.Object({ accepted: Type.Boolean() }) });
 const Screen = Type.Object({ terminal: Type.Object({ source: Type.Literal("screen"), tail: Type.Array(Type.String()) }) });
 const Lifecycle = Type.Object({ terminal: Type.Object({
   exitCause: Type.Optional(Type.Object({ kind: Type.Union([
@@ -68,12 +68,14 @@ export function renameTab(title: string): void {
 }
 
 export function sendCommand(handle: string, command: string): void {
-  call(["send", "--terminal", handle, "--text", command, "--enter"], Sent);
+  const result = call(["send", "--terminal", handle, "--text", command, "--enter"], Sent);
+  if (!result.send.accepted) throw new Error("Orca returned explicit input rejection");
 }
 
 /** Send Escape without Enter to interrupt the current Pi turn. */
 export function sendEscape(handle: string): void {
-  call(["send", "--terminal", handle, "--text", "\u001b"], Sent);
+  const result = call(["send", "--terminal", handle, "--text", "\u001b"], Sent);
+  if (!result.send.accepted) throw new Error("Orca returned explicit Escape rejection");
 }
 
 export function readScreen(handle: string, lines: number): string {

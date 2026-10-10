@@ -43,7 +43,7 @@ for (const abrupt of [false, true]) {
         "-e", join(root, "test/fixtures/operator-tools.ts"),
       ],
       env: {
-        PI_CODING_AGENT_DIR: dir, PI_SUBAGENT_SESSION: session, PI_SUBAGENT_AUTO_EXIT: "0",
+        PI_CODING_AGENT_DIR: dir, PI_SUBAGENT_RUN: JSON.stringify({ cli: "pi", runDir: dir, outputAfter: 0 }), PI_SUBAGENT_SESSION: session, PI_SUBAGENT_AUTO_EXIT: "0",
         PI_SUBAGENT_ID: "operator-tools-test", PI_SUBAGENT_ACTIVITY_FILE: "",
         PI_SUBAGENT_CONVERSATION_PROFILE: "", PI_SUBAGENT_LAUNCH_SETTINGS: JSON.stringify(launch),
       },

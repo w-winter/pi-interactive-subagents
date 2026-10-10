@@ -4,7 +4,6 @@ import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync, statSync } 
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import * as orca from "./orca.ts";
-import type { PollResult } from "./completion.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -1075,19 +1074,8 @@ export function sendEscape(surface: string): void {
   zellijActionSync(["write", "27"], surface);
 }
 
-/**
- * Send a long command to a pane by writing it to a script file first.
- * This avoids terminal line-wrapping issues that break commands exceeding the
- * pane's column width when sent character-by-character via sendCommand.
- *
- * By default the script is written to a temp directory, but callers can pass a
- * stable path (for example under session artifacts) so the exact invocation is
- * preserved for debugging.
- *
- * Returns the script path.
- */
-export function sendLongCommand(
-  surface: string,
+/** Write a retained Bash script and return its path; dispatch belongs to the caller. */
+export function writeCommandScript(
   command: string,
   options?: { scriptPath?: string; scriptPreamble?: string },
 ): string {
@@ -1109,8 +1097,16 @@ export function sendLongCommand(
   writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
     mode: 0o755,
   });
-  sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
   return scriptPath;
+}
+
+/** Write a retained script and dispatch it once to its addressed pane. */
+export function sendLongCommand(
+  surface: string, command: string, options?: { scriptPath?: string; scriptPreamble?: string },
+): string {
+  const path = writeCommandScript(command, options);
+  sendCommand(surface, `bash ${shellEscape(path)}`);
+  return path;
 }
 
 /**
@@ -1229,31 +1225,3 @@ export function closeSurface(surface: string): void {
 
   zellijActionSync(["close-pane"], surface);
 }
-
-/**
- * Interpret an `.exit` sidecar payload (written by subagent_done / caller_ping /
- * the error path in subagent-done.ts). Centralized so both the fast and slow
- * paths in pollForExit decode the payload the same way.
- */
-export function interpretExitSidecar(data: any): PollResult {
-  if (data?.type === "ping") {
-    return {
-      reason: "ping",
-      exitCode: 0,
-      ping: { name: data.name, message: data.message },
-    };
-  }
-  if (data?.type === "error") {
-    const errorMessage =
-      typeof data.errorMessage === "string" && data.errorMessage.trim() !== ""
-        ? data.errorMessage
-        : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
-    return { reason: "error", exitCode: 1, errorMessage };
-  }
-  if (data?.type === "quit") {
-    return { reason: "quit", exitCode: 0 };
-  }
-  return { reason: "done", exitCode: 0 };
-}
-
-export const __pollForExitTest__ = { interpretExitSidecar };

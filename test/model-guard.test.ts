@@ -37,7 +37,7 @@ test("subagent selection survives extension setters; manual changes survive turn
       cliPath, cwd: dir, args: [...args, ...selectionArgs],
       env: {
         PI_CODING_AGENT_DIR: dir,
-        PI_SUBAGENT_SESSION: sessionPath,
+        PI_SUBAGENT_RUN: JSON.stringify({ cli: "pi", runDir: dir, outputAfter: 0 }), PI_SUBAGENT_SESSION: sessionPath,
         PI_SUBAGENT_AUTO_EXIT: "0",
         PI_SUBAGENT_ID: "model-guard-test",
         PI_SUBAGENT_ACTIVITY_FILE: "",
@@ -119,6 +119,7 @@ test("loading the child extension in an ordinary session does not restrict exten
     assert.equal(state.thinkingLevel, "medium");
   } finally {
     await rpc.stop();
+    assert.doesNotMatch(rpc.getStderr(), /quit_publication_failed/);
     execFileSync("trash", [dir]);
   }
 });
@@ -152,7 +153,7 @@ test("fork launch overrides remain authoritative when resumed before the first c
         "--session-dir", sessionDir, "--session", sessionPath,
         "-e", meddler, "-e", childExtension, "-e", provider, ...selectionArgs,
       ],
-      env: { PI_CODING_AGENT_DIR: dir, PI_SUBAGENT_SESSION: sessionPath, PI_SUBAGENT_AUTO_EXIT: "0" },
+      env: { PI_CODING_AGENT_DIR: dir, PI_SUBAGENT_RUN: JSON.stringify({ cli: "pi", runDir: dir, outputAfter: 0 }), PI_SUBAGENT_ID: "model-guard-fork", PI_SUBAGENT_SESSION: sessionPath, PI_SUBAGENT_AUTO_EXIT: "0" },
     });
   }
   const initial = client(["--model", "guard-test/astra", "--thinking", "xhigh"]);

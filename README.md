@@ -130,7 +130,17 @@ Multiple subagents run concurrently — each steers its result back independentl
 
 Completion messages render with a colored background and are expandable with `Ctrl+O` to show the full summary and session file path.
 
-Running children stay open across a parent `/reload`. The parent reconnects its status display and completion delivery after reloading. Quitting or replacing the parent session closes its tracked children. Within one parent process, `subagent_resume` reports an error if that session is already running or another resume is starting, including when the supplied path is a symlink to the same file.
+### Reopening a parent session
+
+Started children keep running when their parent quits, changes session, or reloads. Open the original parent session to recover their monitoring and results. Answers completed while the parent was closed appear in its conversation without starting a model turn; a child that finishes after monitoring resumes sends its normal completion notification. PIS retains each execution's answer and checks the parent's recorded results before delivering it again.
+
+Use each recovered child's original pane to interrupt or close it. Completed recovered panes can remain open, including idle autonomous Claude sessions. Close an existing Claude session before starting another CLI run with its `resumeSessionId`. A same-process `/reload` retains the existing pane controls.
+
+An accepted launch that has not started can remain pending while its parent stays open. Reopening the parent cancels that pending launch and reports that it did not start. Started work continues; interrupted Pi sessions need an explicit `subagent_resume` request. A running or uncertain Pi execution blocks another resume of that child session, including through a symlink to the same file.
+
+If you remove an unrecorded child notification from Pi's queue, its saved answer is recovered when you leave and reopen the parent session or restart Pi with that session. Reloading alone retains the current delivery attempt. Keep one writer per session file. When a CLI exits before saving its answer, PIS captures the eligible text when the parent observes that exit; another writer can change that text in the meantime. Monitoring follows the foreground CLI process; the terminal service controls whether that process survives closure.
+
+When updating PIS, finish active children and reload each PIS-using parent before launching more children. Run `npm run test:restart-recovery` for isolated native-process checks with fake providers and terminals. Receipts and transcripts are written under `test/artifacts/restart-recovery/`.
 
 Pi child stderr, including startup warnings and fatal errors, is written to a private file under the parent's session artifacts in `subagent-stderr/`. Launch acknowledgements include `stderrFile`, and failure messages include its path. Stdout remains connected to the interactive terminal. Check the stderr file when a child fails; review it for sensitive content before sharing it.
 
@@ -251,7 +261,7 @@ subagent_interrupt({ name: "Scout" });
 
 This sends Escape to the child pane, cancelling the in-progress model turn. The subagent session stays alive — the pane, session file, and background polling all remain intact. After the interrupt, the widget immediately moves the child back to `waiting`, and stale pre-interrupt snapshots are ignored. If the child starts work later, newer snapshots return it to `active`; completion, failure, and `caller_ping` still flow through normally.
 
-This is a turn-level interrupt, not a method for forcibly terminating a subagent session.
+After restarting Pi or leaving and reopening the parent session, use the child's original pane for interruption and closure.
 
 > **Note:** Only Pi-backed subagents are supported. Claude-backed runs will return an error.
 

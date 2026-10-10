@@ -1,3 +1,5 @@
+import { decodeRun } from "../pi-extension/subagents/run-records.ts";
+import { findLatestAssistantError } from "../pi-extension/subagents/session.ts";
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
@@ -53,10 +55,7 @@ import {
 import subagentDoneExtension, {
   shouldMarkUserTookOver,
   shouldAutoExitOnSettled,
-  findLatestAssistantError,
-  writeExitSidecarIfAbsent,
 } from "../pi-extension/subagents/subagent-done.ts";
-import { __pollForExitTest__ } from "../pi-extension/subagents/mux.ts";
 
 // --- Helpers ---
 
@@ -1205,206 +1204,6 @@ describe("subagent-done.ts", () => {
     };
   }
 
-  describe("writeExitSidecarIfAbsent", () => {
-    it("writes a quit sidecar when no sidecar exists", () => withTempDir((dir) => {
-      const sessionFile = join(dir, "session.jsonl");
-
-      assert.equal(writeExitSidecarIfAbsent(sessionFile, { type: "quit" }), "written");
-      assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), { type: "quit" });
-    }));
-
-    it("does not overwrite an existing sidecar", () => withTempDir((dir) => {
-      const sessionFile = join(dir, "session.jsonl");
-      writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
-
-      assert.equal(writeExitSidecarIfAbsent(sessionFile, { type: "quit" }), "exists");
-      assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), { type: "done" });
-    }));
-
-    it("distinguishes missing session and write failures from claimed sidecars", () => withTempDir((dir) => {
-      assert.equal(writeExitSidecarIfAbsent(undefined, { type: "quit" }), "missing-session");
-      assert.equal(
-        writeExitSidecarIfAbsent(join(dir, "missing", "session.jsonl"), { type: "quit" }),
-        "write-error",
-      );
-    }));
-  });
-
-  describe("sidecar-producing shutdown paths", () => {
-    it("normal auto-exit writes a done sidecar", () => withTempDir((dir) => {
-      const previousSession = process.env.PI_SUBAGENT_SESSION;
-      const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
-      const sessionFile = join(dir, "session.jsonl");
-      process.env.PI_SUBAGENT_SESSION = sessionFile;
-      process.env.PI_SUBAGENT_AUTO_EXIT = "1";
-      const { api, handlers } = createMockSubagentDoneApi();
-      let shutdownCalled = false;
-      const ctx = {
-        shutdown() {
-          assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), { type: "done" });
-          shutdownCalled = true;
-        },
-      };
-
-      try {
-        subagentDoneExtension(api);
-        handlers.get("agent_end")?.({ messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
-        handlers.get("agent_settled")?.({}, ctx);
-        assert.equal(shutdownCalled, true);
-        assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), { type: "done" });
-
-        rmSync(`${sessionFile}.exit`, { force: true });
-        handlers.get("session_shutdown")?.({ reason: "quit" });
-        assert.throws(() => readFileSync(`${sessionFile}.exit`, "utf8"), /ENOENT/);
-      } finally {
-        restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
-        restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
-      }
-    }));
-
-    it("provider-error auto-exit writes an error sidecar", () => withTempDir((dir) => {
-      const previousSession = process.env.PI_SUBAGENT_SESSION;
-      const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
-      const sessionFile = join(dir, "session.jsonl");
-      process.env.PI_SUBAGENT_SESSION = sessionFile;
-      process.env.PI_SUBAGENT_AUTO_EXIT = "1";
-      const { api, handlers } = createMockSubagentDoneApi();
-      let shutdownCalled = false;
-      const expectedSidecar = {
-        type: "error",
-        errorMessage: "529 overloaded",
-        stopReason: "error",
-      };
-      const ctx = {
-        shutdown() {
-          assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), expectedSidecar);
-          shutdownCalled = true;
-        },
-      };
-
-      try {
-        subagentDoneExtension(api);
-        handlers.get("agent_end")?.({
-          messages: [{ role: "assistant", stopReason: "error", errorMessage: "529 overloaded" }],
-        }, ctx);
-        handlers.get("agent_settled")?.({}, ctx);
-        assert.equal(shutdownCalled, true);
-        assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), expectedSidecar);
-
-        rmSync(`${sessionFile}.exit`, { force: true });
-        handlers.get("session_shutdown")?.({ reason: "quit" });
-        assert.throws(() => readFileSync(`${sessionFile}.exit`, "utf8"), /ENOENT/);
-      } finally {
-        restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
-        restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
-      }
-    }));
-
-    it("session_shutdown quit writes a quit sidecar only when absent", () => withTempDir((dir) => {
-      const previousSession = process.env.PI_SUBAGENT_SESSION;
-      const sessionFile = join(dir, "session.jsonl");
-      process.env.PI_SUBAGENT_SESSION = sessionFile;
-      const { api, handlers } = createMockSubagentDoneApi();
-
-      try {
-        subagentDoneExtension(api);
-        handlers.get("session_shutdown")?.({ reason: "quit" });
-        assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), { type: "quit" });
-
-        writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
-        handlers.get("session_shutdown")?.({ reason: "quit" });
-        assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), { type: "done" });
-      } finally {
-        restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
-      }
-    }));
-
-    it("does not suppress quit fallback after a failed sidecar write", () => withTempDir((dir) => {
-      const previousSession = process.env.PI_SUBAGENT_SESSION;
-      const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
-      const sessionDir = join(dir, "missing");
-      const sessionFile = join(sessionDir, "session.jsonl");
-      process.env.PI_SUBAGENT_SESSION = sessionFile;
-      process.env.PI_SUBAGENT_AUTO_EXIT = "1";
-      const { api, handlers } = createMockSubagentDoneApi();
-      const ctx = { shutdown() {} };
-
-      try {
-        subagentDoneExtension(api);
-        handlers.get("agent_end")?.({ messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
-        handlers.get("agent_settled")?.({}, ctx);
-
-        mkdirSync(sessionDir);
-        handlers.get("session_shutdown")?.({ reason: "quit" });
-        assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), { type: "quit" });
-      } finally {
-        restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
-        restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
-      }
-    }));
-
-    it("subagent_done is not reclassified as quit after the sidecar is consumed", async () => {
-      await withTempDirAsync(async (dir) => {
-        const previousSession = process.env.PI_SUBAGENT_SESSION;
-        const sessionFile = join(dir, "session.jsonl");
-        process.env.PI_SUBAGENT_SESSION = sessionFile;
-        const { api, handlers, registeredTools } = createMockSubagentDoneApi();
-        let shutdownCalled = false;
-        const ctx = { shutdown() { shutdownCalled = true; } };
-
-        try {
-          subagentDoneExtension(api);
-          const tool = registeredTools.find((registeredTool) => registeredTool.name === "subagent_done");
-          assert.ok(tool, "expected subagent_done tool to be registered");
-
-          await tool.execute("tool-call", {}, undefined, undefined, ctx);
-          assert.equal(shutdownCalled, true);
-          assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), { type: "done" });
-
-          rmSync(`${sessionFile}.exit`, { force: true });
-          handlers.get("session_shutdown")?.({ reason: "quit" });
-          assert.throws(() => readFileSync(`${sessionFile}.exit`, "utf8"), /ENOENT/);
-        } finally {
-          restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
-        }
-      });
-    });
-
-    it("caller_ping is not reclassified as quit after the sidecar is consumed", async () => {
-      await withTempDirAsync(async (dir) => {
-        const previousSession = process.env.PI_SUBAGENT_SESSION;
-        const previousName = process.env.PI_SUBAGENT_NAME;
-        const sessionFile = join(dir, "session.jsonl");
-        process.env.PI_SUBAGENT_SESSION = sessionFile;
-        process.env.PI_SUBAGENT_NAME = "PingWorker";
-        const { api, handlers, registeredTools } = createMockSubagentDoneApi();
-        let shutdownCalled = false;
-        const ctx = { shutdown() { shutdownCalled = true; } };
-
-        try {
-          subagentDoneExtension(api);
-          const tool = registeredTools.find((registeredTool) => registeredTool.name === "caller_ping");
-          assert.ok(tool, "expected caller_ping tool to be registered");
-
-          await tool.execute("tool-call", { message: "need help" }, undefined, undefined, ctx);
-          assert.equal(shutdownCalled, true);
-          assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), {
-            type: "ping",
-            name: "PingWorker",
-            message: "need help",
-          });
-
-          rmSync(`${sessionFile}.exit`, { force: true });
-          handlers.get("session_shutdown")?.({ reason: "quit" });
-          assert.throws(() => readFileSync(`${sessionFile}.exit`, "utf8"), /ENOENT/);
-        } finally {
-          restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
-          restoreEnvVar("PI_SUBAGENT_NAME", previousName);
-        }
-      });
-    });
-  });
-
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {
       assert.equal(shouldMarkUserTookOver(false), false);
@@ -1482,61 +1281,6 @@ describe("subagent-done.ts", () => {
   });
 });
 
-describe("mux.ts interpretExitSidecar", () => {
-  const { interpretExitSidecar } = __pollForExitTest__;
-
-  it("decodes ping payloads", () => {
-    assert.deepEqual(
-      interpretExitSidecar({ type: "ping", name: "Worker", message: "need help" }),
-      {
-        reason: "ping",
-        exitCode: 0,
-        ping: { name: "Worker", message: "need help" },
-      },
-    );
-  });
-
-  it("decodes done payloads", () => {
-    assert.deepEqual(interpretExitSidecar({ type: "done" }), {
-      reason: "done",
-      exitCode: 0,
-    });
-  });
-
-  it("decodes quit payloads", () => {
-    assert.deepEqual(interpretExitSidecar({ type: "quit" }), {
-      reason: "quit",
-      exitCode: 0,
-    });
-  });
-
-  it("decodes error payloads and propagates the message with a non-zero exit code", () => {
-    assert.deepEqual(
-      interpretExitSidecar({
-        type: "error",
-        errorMessage: "Anthropic 529 Overloaded after 3 retries",
-        stopReason: "error",
-      }),
-      {
-        reason: "error",
-        exitCode: 1,
-        errorMessage: "Anthropic 529 Overloaded after 3 retries",
-      },
-    );
-  });
-
-  it("falls back to a placeholder when error payload has no errorMessage", () => {
-    const result = interpretExitSidecar({ type: "error" });
-    assert.equal(result.reason, "error");
-    assert.equal(result.exitCode, 1);
-    assert.match(result.errorMessage ?? "", /no errorMessage/);
-  });
-
-  it("treats unknown payload shapes as done", () => {
-    assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
-    assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
-  });
-});
 describe("commands", () => {
   it("leaves plan and iterate names available for user prompt templates", () => {
     const { api, registeredCommands } = createMockExtensionApi();
@@ -1559,15 +1303,6 @@ describe("tool registration", () => {
       autoExit: false,
       interactive: true,
     });
-  });
-
-  it("uses the quit fallback for resumed sessions without assistant output", () => {
-    const testApi = (subagentsModule as any).__test__;
-
-    assert.equal(
-      testApi.resolveResumeSummary([], { exitCode: 0, exitReason: "quit" }),
-      "Sub-agent session was closed by the user before it called subagent_done.",
-    );
   });
 
   it("expands spawning false to deny subagent interruption", () => {
@@ -1785,20 +1520,30 @@ describe("subagent activity snapshots", () => {
   });
 });
 
+type RunningFixtureOverrides = Partial<{
+  id: string; name: string; task: string; agent: string; surface: string; startTime: number;
+  sessionFile: string; interactive: boolean; cli: "claude"; activityFile: string;
+  statusState: ReturnType<typeof createStatusState>;
+  activity: Extract<ReturnType<typeof readSubagentActivityFile>, { ok: true }>['activity'];
+  activityRead: ReturnType<typeof readSubagentActivityFile>;
+  abortController: Pick<AbortController, "abort">;
+}>;
+function runningFixture(overrides: RunningFixtureOverrides = {}) {
+  const fields = { id: "a1", name: "Worker", task: "", surface: "pane-1", startTime: 0,
+    sessionFile: "worker.jsonl", interactive: false, statusState: createStatusState({ source: "pi", startTimeMs: 0 }), ...overrides };
+  const record = decodeRun({
+    id: fields.id, name: fields.name, task: fields.task, agent: fields.agent ?? null,
+    startTime: fields.startTime, interactive: fields.interactive, runDir: join(tmpdir(), "unit-run"),
+    owner: { sessionId: "unit-parent", sessionFile: join(tmpdir(), "unit-parent.jsonl") },
+    launch: fields.cli === "claude" ? { kind: "claude" } : { kind: "pi-fresh", autoExit: false,
+      sessionFile: join(tmpdir(), fields.sessionFile), activityFile: fields.activityFile ?? null, stderrFile: null },
+  });
+  return { record, control: "current", surface: fields.surface, launchScriptFile: join(tmpdir(), "fixture.sh"),
+    statusState: fields.statusState, activity: fields.activity, activityRead: fields.activityRead };
+}
+
 describe("subagent interruption", () => {
-  function makeRunning(overrides: Record<string, unknown> = {}) {
-    return {
-      id: "a1",
-      name: "Worker",
-      task: "",
-      surface: "pane-1",
-      startTime: 0,
-      sessionFile: "worker.jsonl",
-      interactive: false,
-      statusState: createStatusState({ source: "pi", startTimeMs: 0 }),
-      ...overrides,
-    };
-  }
+  const makeRunning = runningFixture;
 
   it("registers subagent_interrupt in the main session extension", () => {
     const { api, registeredTools } = createMockExtensionApi();
@@ -1819,7 +1564,7 @@ describe("subagent interruption", () => {
       runningMap.set("c3", makeRunning({ id: "c3", name: "Scout", surface: "c3", sessionFile: "c3.jsonl" }));
 
       const byId = testApi.resolveInterruptTarget({ id: "c3", name: "Worker" });
-      assert.equal(byId.running.id, "c3");
+      assert.equal(byId.running.record.id, "c3");
 
       const ambiguous = testApi.resolveInterruptTarget({ name: "Worker" });
       assert.match(ambiguous.error, /Ambiguous subagent name/);
@@ -2104,6 +1849,19 @@ describe("subagent interruption", () => {
     assert.match(presentation, /Resume: pi --session/);
   });
 
+  it("uses interrupted renderer status without inventing successful exit status", () => {
+    const { api, registeredMessageRenderers } = createMockExtensionApi();
+    // SAFETY: The mock supplies the API for registering renderers exercised by this test.
+    (subagentsModule as any).default(api);
+    const rendererEntry = registeredMessageRenderers.find((entry) => entry.name === "subagent_result");
+    assert.ok(rendererEntry);
+    const theme = { fg(_color: string, text: string) { return text; }, bg(_color: string, text: string) { return text; }, bold(text: string) { return text; } };
+    const rendered = rendererEntry.renderer({ customType: "subagent_result", content: 'Sub-agent "Worker" was interrupted.\n\nRetained diagnostic.',
+      details: { name: "Worker", exitReason: "interrupted" } }, { expanded: true }, theme);
+    const output = rendered.render(100).join("\n");
+    assert.match(output, /interrupted/); assert.match(output, /Retained diagnostic/); assert.doesNotMatch(output, /completed/);
+  });
+
   it("uses closed by user renderer status for quit exits", () => {
     const { api, registeredMessageRenderers } = createMockExtensionApi();
     (subagentsModule as any).default(api);
@@ -2278,7 +2036,7 @@ describe("subagents widget rendering", () => {
           sessionFile: "sess3",
           statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 27_000 }),
         },
-      ], 16);
+      ].map(runningFixture), 16);
 
       assert.deepEqual(
         lines.map((line: string) => visibleWidth(line)),
@@ -2316,7 +2074,7 @@ describe("subagents widget rendering", () => {
           sessionFile: "sess1",
           statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
         },
-      ], width);
+      ].map(runningFixture), width);
 
       for (const line of lines) {
         assert.ok(

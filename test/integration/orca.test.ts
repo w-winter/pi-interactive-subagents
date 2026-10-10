@@ -1,14 +1,19 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { mkdtempSync, realpathSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { setTimeout } from "node:timers/promises";
 import { Type } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 import { cliCommand } from "../../pi-extension/subagents/orca.ts";
 import { pollForExit } from "../../pi-extension/subagents/completion.ts";
+import { buildRunCommand } from "../../pi-extension/subagents/launch-command.ts";
+import { decodeRun } from "../../pi-extension/subagents/run-records.ts";
 import {
   createSurface, sendCommand, sendEscape, readScreenAsync,
-  closeSurface, shellEscape,
+  closeSurface, shellEscape, sendLongCommand,
 } from "../../pi-extension/subagents/mux.ts";
 
 function activeTabs(): string[] {
@@ -34,6 +39,7 @@ it("Orca tabs preserve focus, target input, deliver Escape, and report completio
   const previous = process.env.PI_SUBAGENT_MUX;
   process.env.PI_SUBAGENT_MUX = "orca";
   const children: string[] = [];
+  const runDir = realpathSync(mkdtempSync(join(tmpdir(), "pis-orca-shell-")));
   const signal = AbortSignal.timeout(25_000);
   async function waitForOutput(handle: string, marker: string): Promise<string> {
     for (;;) {
@@ -62,9 +68,13 @@ it("Orca tabs preserve focus, target input, deliver Escape, and report completio
     await waitForOutput(first, "RAW_READY");
     sendEscape(first);
     await waitForOutput(first, "BYTE_27");
-    sendCommand(second, "printf '__SUBAGENT_%s_0__\\n' DONE");
-    const result = await pollForExit(second, signal, { interval: 100 });
-    assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+    const run = decodeRun({ id: "orca-shell", name: "Orca shell", task: "", agent: null,
+      startTime: Date.now(), interactive: true, runDir, owner: { sessionId: "integration", sessionFile: join(runDir, "parent.jsonl") },
+      launch: { kind: "pi-fresh", sessionFile: join(runDir, "child.jsonl"), activityFile: null, stderrFile: null, autoExit: false } });
+    sendLongCommand(second, buildRunCommand({ id: run.id, runDir, cwd: runDir, execCommand: "exec /usr/bin/true" }), { scriptPath: join(runDir, "launch.sh") });
+    const result = await pollForExit(run, signal, { interval: 100, onTick() {}, onUnavailable() {}, operatorClosed: null, claimMissing: null });
+    assert.ok(result.kind === "outcome" && result.outcome.reason === "sentinel");
+    assert.equal(result.outcome.exitCode, 0);
     assert.ok(!(await readScreenAsync(first, 50)).includes("__SUBAGENT_DONE_0__"));
   } finally {
     try {
@@ -72,6 +82,7 @@ it("Orca tabs preserve focus, target input, deliver Escape, and report completio
     } finally {
       if (previous === undefined) delete process.env.PI_SUBAGENT_MUX;
       else process.env.PI_SUBAGENT_MUX = previous;
+      execFileSync("trash", [runDir]);
     }
   }
 });

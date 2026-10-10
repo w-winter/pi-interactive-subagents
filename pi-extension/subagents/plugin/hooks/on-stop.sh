@@ -1,68 +1,88 @@
 #!/usr/bin/env bash
-# Stop hook for pi-spawned Claude sessions.
-# Writes a sentinel file when Claude completes autonomously (no user interjection).
-
+# Preserve the response from a PIS-managed Claude Stop without changing its completion policy.
 set -euo pipefail
+[ -n "${PI_SUBAGENT_RUN:-}" ] || exit 0
+python3 -c '
+import json
+import math
+import os
+import sys
+import tempfile
+from pathlib import Path
 
-# Read JSON input from stdin
-input=$(cat)
 
-# Guard: if stop_hook_active is true, we're in a loop — bail out
-stop_hook_active=$(echo "$input" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('stop_hook_active', False))" 2>/dev/null || echo "False")
-if [ "$stop_hook_active" = "True" ]; then
-  exit 0
-fi
+def publish(path, payload, replace=False):
+    descriptor, temporary = tempfile.mkstemp(prefix="." + path.name, dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            json.dump(payload, stream)
+        if replace:
+            os.replace(temporary, path)
+        else:
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                with path.open() as stream:
+                    original = json.load(stream)
+                if original.get("id") != payload["id"]:
+                    raise ValueError("Existing completion belongs to another execution")
+                timestamp = original.get("recordedAt")
+                if type(timestamp) not in (int, float) or not math.isfinite(timestamp) or timestamp < 0:
+                    raise ValueError("Invalid retained completion timestamp")
+                if original.get("reason") not in ("done", "quit", "sentinel", "interrupted"):
+                    raise ValueError("Invalid retained Claude completion reason")
+                output = original.get("output")
+                if not isinstance(output, dict) or output.get("cli") != "claude":
+                    raise ValueError("Invalid retained Claude output")
+                if "text" not in output or (output["text"] is not None and not isinstance(output["text"], str)):
+                    raise ValueError("Invalid retained Claude text")
+                if "transcriptPath" not in output:
+                    raise ValueError("Missing retained Claude transcript path")
+                transcript = output["transcriptPath"]
+                if transcript is not None and (not isinstance(transcript, str) or not Path(transcript).is_absolute()):
+                    raise ValueError("Invalid retained Claude transcript path")
+                if original["reason"] == "sentinel":
+                    status = original.get("exitCode")
+                    if type(status) is not int or status < 0:
+                        raise ValueError("Invalid retained shell status")
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
-# Guard: only act for pi-spawned sessions
-if [ -z "${PI_CLAUDE_SENTINEL:-}" ]; then
-  exit 0
-fi
 
-# Get transcript path
-transcript_path=$(echo "$input" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('transcript_path', ''))" 2>/dev/null || echo "")
-if [ -z "$transcript_path" ] || [ ! -f "$transcript_path" ]; then
-  exit 0
-fi
-
-# Count real human messages in transcript (not tool results)
-# Claude's transcript format:
-#   Human message: {"type": "user", "message": {"role": "user", "content": "..."}}
-#   Tool result:   {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", ...}]}}
-# We only count entries where content is a string (real human input)
-user_msg_count=$(python3 - "$transcript_path" <<'EOF'
-import sys, json
-
-transcript_path = sys.argv[1]
-count = 0
-with open(transcript_path, 'r') as f:
-    for line in f:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entry = json.loads(line)
-            if entry.get('type') != 'user':
+try:
+    packet = json.load(sys.stdin)
+    if packet.get("stop_hook_active", False):
+        sys.exit(0)
+    context = json.loads(os.environ["PI_SUBAGENT_RUN"])
+    if context["cli"] != "claude":
+        raise ValueError("Stop hook requires a Claude run context")
+    run_dir = Path(context["runDir"])
+    if not run_dir.is_absolute():
+        raise ValueError("Run directory must be absolute")
+    identity = os.environ["PI_SUBAGENT_ID"]
+    transcript = Path(packet.get("transcript_path", ""))
+    if not transcript.is_absolute() or not transcript.is_file():
+        raise ValueError("Missing Claude transcript")
+    text = packet.get("last_assistant_message", "")
+    if not isinstance(text, str):
+        raise ValueError("Invalid Claude response")
+    count = 0
+    with transcript.open() as stream:
+        for line in stream:
+            if not line.strip():
                 continue
-            content = entry.get('message', {}).get('content', '')
-            # Real human messages have string content
-            # Tool results have array content with tool_result blocks
-            if isinstance(content, str):
+            entry = json.loads(line)
+            if entry.get("type") == "user" and isinstance(entry.get("message", {}).get("content"), str):
                 count += 1
-        except (json.JSONDecodeError, AttributeError):
-            pass
-print(count)
-EOF
-)
-
-# Always write transcript path so the watcher can copy the session file
-if [ -n "$transcript_path" ]; then
-  echo "$transcript_path" > "${PI_CLAUDE_SENTINEL}.transcript" 2>/dev/null || true
-fi
-
-# If exactly 1 user message (the initial prompt), this was autonomous — signal completion
-if [ "$user_msg_count" -eq 1 ]; then
-  # Write last_assistant_message to sentinel so the watcher gets a clean result
-  echo "$input" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('last_assistant_message', ''))" > "$PI_CLAUDE_SENTINEL" 2>/dev/null || touch "$PI_CLAUDE_SENTINEL"
-fi
-
-exit 0
+    publish(run_dir / "response.json", {"id": identity, "text": text, "transcriptPath": str(transcript)}, replace=True)
+    if count == 1:
+        import time
+        publish(run_dir / "completion.json", {
+            "id": identity, "recordedAt": time.time() * 1000, "reason": "done",
+            "output": {"cli": "claude", "text": text, "transcriptPath": str(transcript)},
+        })
+except Exception as error:
+    print("[subagents:completion-file] " + json.dumps({"event": "claude_publication_failed", "error": type(error).__name__}), file=sys.stderr)
+    sys.exit(1)
+'

@@ -27,7 +27,7 @@ test("PIS extracts the selected branch's answer after native tree navigation", a
       "-e", join(root, "pi-extension/subagents/subagent-done.ts"),
     ],
     env: {
-      PI_CODING_AGENT_DIR: dir, PI_SUBAGENT_SESSION: sessionPath, PI_SUBAGENT_AUTO_EXIT: "0",
+      PI_CODING_AGENT_DIR: dir, PI_SUBAGENT_RUN: JSON.stringify({ cli: "pi", runDir: dir, outputAfter: 0 }), PI_SUBAGENT_SESSION: sessionPath, PI_SUBAGENT_AUTO_EXIT: "0",
       PI_SUBAGENT_ID: "branch-result-test", PI_SUBAGENT_ACTIVITY_FILE: "",
       PI_SUBAGENT_CONVERSATION_PROFILE: "",
     },

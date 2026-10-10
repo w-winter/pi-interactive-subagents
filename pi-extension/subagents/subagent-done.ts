@@ -6,7 +6,9 @@
 import type { AgentEndEvent, ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
+import { existsSync } from "node:fs";
+import { publishOutcome, readRunContext, type RunOutcome, type RunContext } from "./run-records.ts";
+import { findLastAssistantMessage, getBranchEntries, findLatestAssistantError, type SubagentErrorInfo } from "./session.ts";
 import { createSubagentActivityRecorder } from "./activity.ts";
 import { parseConversationProfile } from "./conversation-profile.ts";
 import { installSubagentModelGuard } from "./model-guard.ts";
@@ -45,10 +47,6 @@ export function shouldAutoExitOnSettled(
   return true;
 }
 
-export interface SubagentErrorInfo {
-  errorMessage: string;
-  stopReason: "error" | "length";
-}
 
 type ChildExitSidecarPayload =
   | { type: "done" }
@@ -56,50 +54,10 @@ type ChildExitSidecarPayload =
   | ({ type: "error" } & SubagentErrorInfo)
   | { type: "quit" };
 
-export type ExitSidecarWriteResult = "written" | "exists" | "missing-session" | "write-error";
-
-export function writeExitSidecarIfAbsent(
-  sessionFile: string | undefined,
-  payload: ChildExitSidecarPayload,
-): ExitSidecarWriteResult {
-  if (!sessionFile) return "missing-session";
-  const exitFile = `${sessionFile}.exit`;
-  try {
-    writeFileSync(exitFile, JSON.stringify(payload), { flag: "wx" });
-    return "written";
-  } catch (error) {
-    const code = typeof error === "object" && error !== null && "code" in error
-      ? (error as { code?: unknown }).code
-      : undefined;
-    return code === "EEXIST" ? "exists" : "write-error";
-  }
-}
-
-/** Report provider failures and incomplete output from the latest assistant turn. */
-export function findLatestAssistantError(
-  messages: any[] | undefined,
-): SubagentErrorInfo | null {
-  if (!messages) return null;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (msg?.role !== "assistant") continue;
-    if (msg.stopReason === "length") {
-      return {
-        errorMessage: "Subagent reached the output token limit; its response is incomplete.",
-        stopReason: "length",
-      };
-    }
-    if (msg.stopReason !== "error") return null;
-    const raw = typeof msg.errorMessage === "string" ? msg.errorMessage.trim() : "";
-    return {
-      errorMessage: raw || "Subagent agent loop ended with stopReason=error (no errorMessage field).",
-      stopReason: "error",
-    };
-  }
-  return null;
-}
-
 export default function (pi: SubagentExtensionAPI) {
+  const managed = readRunContext();
+  if (managed && managed.cli !== "pi") throw new Error("Pi child extension requires a Pi run context");
+  const context = managed;
   if (process.env.PI_SUBAGENT_SESSION) installSubagentModelGuard();
 
   let toolNames: string[] = [];
@@ -171,18 +129,24 @@ export default function (pi: SubagentExtensionAPI) {
 
   let userTookOver = false;
   let agentStarted = false;
-  let exitSidecarClaimed = false;
+  let outcomeClaimed = false;
   let completedMessages: AgentEndEvent["messages"] = [];
 
-  function claimExitSidecar(
-    sessionFile: string | undefined,
-    payload: ChildExitSidecarPayload,
-  ): ExitSidecarWriteResult {
-    const result = writeExitSidecarIfAbsent(sessionFile, payload);
-    if (result === "written" || result === "exists") {
-      exitSidecarClaimed = true;
+  function claimExit(context: Extract<RunContext, { cli: "pi" }>, payload: ChildExitSidecarPayload): Error | null {
+    try {
+      const { id, sessionFile } = context;
+      const common = { id, recordedAt: Date.now() };
+      let outcome: RunOutcome;
+      if (payload.type === "ping") outcome = { ...common, reason: "ping", name: payload.name, message: payload.message };
+      else if (payload.type === "error") outcome = { ...common, reason: "error", errorMessage: payload.errorMessage, stopReason: payload.stopReason };
+      else outcome = { ...common, reason: payload.type,
+        output: { cli: "pi", text: findLastAssistantMessage(existsSync(sessionFile) ? getBranchEntries(sessionFile, context.outputAfter) : []) } };
+      publishOutcome({ id, runDir: context.runDir }, outcome);
+      outcomeClaimed = true;
+      return null;
+    } catch (error) {
+      return error instanceof Error ? error : new Error(String(error));
     }
-    return result;
   }
 
   // Show widget + status bar on session start
@@ -228,22 +192,21 @@ export default function (pi: SubagentExtensionAPI) {
   });
 
   pi.on("agent_settled", (_event, ctx) => {
-    const shouldExit = autoExit && shouldAutoExitOnSettled(userTookOver, completedMessages);
+    const shouldExit = context && autoExit && shouldAutoExitOnSettled(userTookOver, completedMessages);
 
     if (shouldExit) {
       // The last low-level run may have failed before Pi completed recovery.
       const errorInfo = findLatestAssistantError(completedMessages);
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (errorInfo) {
-        claimExitSidecar(sessionFile, {
-          type: "error",
-          errorMessage: errorInfo.errorMessage,
-          stopReason: errorInfo.stopReason,
-        });
-      } else {
-        claimExitSidecar(sessionFile, { type: "done" });
+      const failure = claimExit(context, errorInfo ? {
+        type: "error",
+        errorMessage: errorInfo.errorMessage,
+        stopReason: errorInfo.stopReason,
+      } : { type: "done" });
+      if (failure) {
+        console.error(`[subagents:completion-file] ${JSON.stringify({ event: "publication_failed", id: process.env.PI_SUBAGENT_ID, error: failure.name })}`);
+        recorder.agentEndWaiting();
+        return;
       }
-
       recorder.agentEndDone();
       ctx.shutdown();
       return;
@@ -306,8 +269,9 @@ export default function (pi: SubagentExtensionAPI) {
     const reason = (event as any).reason;
     recorder.sessionShutdown(reason);
 
-    if (reason === "quit" && !exitSidecarClaimed) {
-      claimExitSidecar(process.env.PI_SUBAGENT_SESSION, { type: "quit" });
+    if (context && reason === "quit" && !outcomeClaimed) {
+      const failure = claimExit(context, { type: "quit" });
+      if (failure) console.error(`[subagents:completion-file] ${JSON.stringify({ event: "quit_publication_failed", error: failure.name })}`);
     }
   });
 
@@ -331,11 +295,9 @@ export default function (pi: SubagentExtensionAPI) {
       message: Type.String({ description: "What you need help with" }),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      if (!sessionFile) {
+      if (!context) {
         throw new Error(
-          "caller_ping is only available in subagent contexts. " +
-            "PI_SUBAGENT_SESSION environment variable is not set.",
+          "caller_ping requires a managed subagent session.",
         );
       }
 
@@ -345,7 +307,8 @@ export default function (pi: SubagentExtensionAPI) {
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",
         message: params.message,
       };
-      claimExitSidecar(sessionFile, exitData);
+      const failure = claimExit(context, exitData);
+      if (failure) throw failure;
 
       ctx.shutdown();
       return {
@@ -363,9 +326,10 @@ export default function (pi: SubagentExtensionAPI) {
       "Your LAST assistant message before calling this becomes the summary returned to the caller.",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-      const sessionFile = process.env.PI_SUBAGENT_SESSION;
+      if (!context) throw new Error("subagent_done requires a managed subagent session");
       recorder.subagentDone();
-      claimExitSidecar(sessionFile, { type: "done" });
+      const failure = claimExit(context, { type: "done" });
+      if (failure) throw failure;
       ctx.shutdown();
       return {
         content: [{ type: "text", text: "Shutting down subagent session." }],

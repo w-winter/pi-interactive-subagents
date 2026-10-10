@@ -2,6 +2,8 @@ import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } 
 import { randomBytes, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
+import { Type } from "@sinclair/typebox";
+import { Value } from "@sinclair/typebox/value";
 
 export interface SessionEntry {
   type: string;
@@ -184,4 +186,35 @@ export function mergeNewEntries(
     appendFileSync(targetFile, JSON.stringify(entry) + "\n", "utf8");
   }
   return entries;
+}
+
+const AssistantFailure = Type.Object({ role: Type.Literal("assistant"), stopReason: Type.Optional(Type.Unknown()), errorMessage: Type.Optional(Type.Unknown()) });
+
+export interface SubagentErrorInfo {
+  errorMessage: string;
+  stopReason: "error" | "length";
+}
+
+/** Report provider failures and incomplete output from the latest assistant turn. */
+export function findLatestAssistantError(
+  messages: readonly unknown[] | undefined,
+): SubagentErrorInfo | null {
+  if (!messages) return null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (!Value.Check(AssistantFailure, msg)) continue;
+    if (msg.stopReason === "length") {
+      return {
+        errorMessage: "Subagent reached the output token limit; its response is incomplete.",
+        stopReason: "length",
+      };
+    }
+    if (msg.stopReason !== "error") return null;
+    const raw = Value.Check(Type.String(), msg.errorMessage) ? msg.errorMessage.trim() : "";
+    return {
+      errorMessage: raw || "Subagent agent loop ended with stopReason=error (no errorMessage field).",
+      stopReason: "error",
+    };
+  }
+  return null;
 }

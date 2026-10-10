@@ -23,7 +23,7 @@ test("an interactive child waits after a response and accepts another turn", asy
       "-e", join(root, "pi-extension/subagents/subagent-done.ts"),
     ],
     env: {
-      PI_CODING_AGENT_DIR: dir, PI_SUBAGENT_SESSION: session, PI_SUBAGENT_AUTO_EXIT: "0",
+      PI_CODING_AGENT_DIR: dir, PI_SUBAGENT_RUN: JSON.stringify({ cli: "pi", runDir: dir, outputAfter: 0 }), PI_SUBAGENT_SESSION: session, PI_SUBAGENT_AUTO_EXIT: "0",
       PI_SUBAGENT_ID: "interactive-test", PI_SUBAGENT_ACTIVITY_FILE: activity,
     },
   });

@@ -13,11 +13,12 @@
   },
   "type": "module",
   "scripts": {
-    "test": "node --test test/test.ts test/orca.test.ts test/completion.test.ts test/conversation-profile.test.ts test/interactive.test.ts test/workflow-prompts.test.ts test/command-completions.test.ts test/agent-definitions.test.ts test/branch-result.test.ts test/resume-restrictions.test.ts",
+    "test": "node --test test/test.ts test/orca.test.ts test/completion.test.ts test/conversation-profile.test.ts test/interactive.test.ts test/workflow-prompts.test.ts test/command-completions.test.ts test/agent-definitions.test.ts test/branch-result.test.ts test/resume-restrictions.test.ts test/restart-recovery.test.ts test/recovery-failures.test.ts",
     "test:agent-examples": "node --test test/agent-examples.test.ts",
     "test:model-guard": "node --test test/model-guard.test.ts",
     "test:branch-result": "node --test test/branch-result.test.ts",
-    "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts"
+    "test:integration": "node --test --test-concurrency=1 test/integration/*.test.ts",
+    "test:restart-recovery": "node --test test/restart-recovery.test.ts test/recovery-failures.test.ts"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",

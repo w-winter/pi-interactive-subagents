@@ -1,111 +1,76 @@
-import { existsSync, readFileSync, rmSync } from "node:fs";
 import { setTimeout } from "node:timers/promises";
-import { getMuxBackend, interpretExitSidecar, readScreenAsync } from "./mux.ts";
-import { isTabClosed } from "./orca.ts";
+import {
+  captureOutput, captureShellOutcome, observeActor, publishOutcome, readClaim, readOutcome,
+  cancelUnstarted, type RunRecord, type RunOutcome, type ProcessClaim,
+} from "./run-records.ts";
 
-export interface PollResult {
-  /** How the subagent exited. A confirmed operator close is quit. */
-  reason: "done" | "ping" | "sentinel" | "error" | "quit";
-  /** Shell exit code (from sentinel). 0 for file-based exits and operator closure. */
-  exitCode: number;
-  /** Ping data if reason is "ping" */
-  ping?: { name: string; message: string };
-  /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
-  errorMessage?: string;
+export type RunObservation = { kind: "pending" } | { kind: "suppressed" } | { kind: "outcome"; outcome: RunOutcome };
+
+/** Read retained evidence; claimMissing runs only for an absent claim. Evidence/query/publication failures throw. */
+// oxlint-disable-next-line sonarjs/cognitive-complexity -- Claim, semantic outcome, shell status and actor lifetime have one ordered precedence decision.
+export function observeRun(run: RunRecord, closedByOperator = false, claimMissing: (() => ProcessClaim) | null = null): RunObservation {
+  let claim = readClaim(run);
+  if (!claim && claimMissing) claim = claimMissing();
+  if (!claim && closedByOperator) claim = cancelUnstarted(run, "operator_close");
+  if (!claim) return { kind: "pending" };
+  if (claim.kind === "not_started") {
+    if (claim.cause === "dispatch_failed") return { kind: "suppressed" };
+    return { kind: "outcome", outcome: publishOutcome(run, {
+      id: run.id, recordedAt: claim.observedAt,
+      reason: claim.cause === "operator_close" ? "quit" : "interrupted",
+      output: run.launch.kind === "claude" ? { cli: "claude", text: null, transcriptPath: null } : { cli: "pi", text: null },
+    }) };
+  }
+  const outcome = readOutcome(run);
+  if (outcome) return { kind: "outcome", outcome };
+  const shell = captureShellOutcome(run);
+  if (shell) return { kind: "outcome", outcome: shell };
+  const live = observeActor(claim.executor) === "live" || observeActor(claim.supervisor) === "live";
+  // Producers can publish during process queries; their outcome takes precedence.
+  const completed = readOutcome(run) ?? captureShellOutcome(run);
+  if (completed) return { kind: "outcome", outcome: completed };
+  if (live) return { kind: "pending" };
+  return { kind: "outcome", outcome: publishOutcome(run, {
+    id: run.id, recordedAt: Date.now(), reason: closedByOperator ? "quit" : "interrupted", output: captureOutput(run),
+  }) };
 }
 
-type ExitFileRead =
-  | { kind: "missing" }
-  | { kind: "result"; result: PollResult }
-  | { kind: "unreadable"; file: string; error: Error };
-
-function readExitFile(file: string): ExitFileRead {
-  try {
-    if (!existsSync(file)) return { kind: "missing" };
-    const data: unknown = JSON.parse(readFileSync(file, "utf8"));
-    const result = interpretExitSidecar(data);
-    rmSync(file, { force: true });
-    return { kind: "result", result };
-  } catch (error) {
-    return { kind: "unreadable", file, error: error instanceof Error ? error : new Error(String(error)) };
-  }
-}
-
-function readCompletionFiles(options: { sessionFile?: string; sentinelFile?: string }): PollResult | null {
-  if (options.sessionFile) {
-    const read = readExitFile(`${options.sessionFile}.exit`);
-    if (read.kind === "result") return read.result;
-    if (read.kind === "unreadable") {
-      console.warn(`[subagents:completion-file] ${JSON.stringify({
-        file: read.file, error: read.error.name,
-      })}`);
-    }
-  }
-  if (options.sentinelFile && existsSync(options.sentinelFile)) {
-    return { reason: "sentinel", exitCode: 0 };
-  }
-  return null;
-}
-
-type OrcaTerminalState = "open" | "closed" | "unavailable";
-
-async function readOrcaTerminalState(surface: string, previous: OrcaTerminalState): Promise<OrcaTerminalState> {
-  try {
-    const closed = await isTabClosed(surface);
-    if (previous === "unavailable") {
-      console.info(`[subagents:terminal-lifecycle] ${JSON.stringify({ surface, event: "probe_recovered" })}`);
-    }
-    return closed ? "closed" : "open";
-  } catch (error) {
-    if (previous !== "unavailable") {
-      console.warn(`[subagents:terminal-lifecycle] ${JSON.stringify({
-        surface, event: "probe_failed", error: error instanceof Error ? error.message : String(error),
-      })}`);
-    }
-    return "unavailable";
-  }
-}
-
-/** Poll completion files, shell sentinels, and Orca operator closure. Abort rejects; failed lifecycle queries keep polling. */
-export async function pollForExit(
-  surface: string,
-  signal: AbortSignal,
-  options: {
-    interval: number;
-    sessionFile?: string;
-    sentinelFile?: string;
-    onTick?: (elapsed: number) => void;
-  },
-): Promise<PollResult> {
-  const start = Date.now();
-  const backend = getMuxBackend();
-  let terminalState: OrcaTerminalState = "open";
-
+/** Await retained evidence, reporting each unavailable transition while polling; cancellation only detaches. */
+// oxlint-disable-next-line sonarjs/cognitive-complexity -- This loop jointly owns cancellation and evidence/terminal availability transitions.
+export async function pollForExit(run: RunRecord, signal: AbortSignal, options: {
+  interval: number; onTick: () => void; onUnavailable: () => void; operatorClosed: (() => Promise<boolean>) | null;
+  claimMissing: (() => ProcessClaim) | null;
+}): Promise<Exclude<RunObservation, { kind: "pending" }>> {
+  let closedByOperator = false;
+  let probeUnavailable = false;
+  let evidenceUnavailable = false;
   for (;;) {
     signal.throwIfAborted();
-
-    const completion = readCompletionFiles(options);
-    if (completion) return completion;
-
     try {
-      const screen = await readScreenAsync(surface, 5);
-      const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
-      if (match) return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
-    } catch {}
-
-    if (backend === "orca") {
-      // Closed Orca handles retain metadata and may still return archived screen output.
-      terminalState = await readOrcaTerminalState(surface, terminalState);
+      const observed = observeRun(run, closedByOperator, options.claimMissing);
+      if (evidenceUnavailable) console.info(`[subagents:recovery] ${JSON.stringify({ id: run.id, event: "available" })}`);
+      evidenceUnavailable = false;
+      if (observed.kind !== "pending") return observed;
+    } catch (error) {
+      if (!evidenceUnavailable) {
+        console.warn(`[subagents:recovery] ${JSON.stringify({ id: run.id, event: "unavailable", error: error instanceof Error ? error.message : "Error" })}`);
+        options.onUnavailable();
+      }
+      evidenceUnavailable = true;
     }
-
+    if (!evidenceUnavailable && options.operatorClosed && !closedByOperator) {
+      try {
+        closedByOperator = await options.operatorClosed();
+        if (probeUnavailable) console.info(`[subagents:terminal-lifecycle] ${JSON.stringify({ id: run.id, event: "probe_recovered" })}`);
+        probeUnavailable = false;
+        if (closedByOperator) continue;
+      } catch (error) {
+        if (!probeUnavailable) console.warn(`[subagents:terminal-lifecycle] ${JSON.stringify({ id: run.id, event: "probe_failed", error: error instanceof Error ? error.name : "Error" })}`);
+        probeUnavailable = true;
+      }
+    }
     signal.throwIfAborted();
-    // Completion written during terminal I/O takes precedence over operator closure.
-    const lateCompletion = readCompletionFiles(options);
-    if (lateCompletion) return lateCompletion;
-    if (terminalState === "closed") return { reason: "quit", exitCode: 0 };
-
-    options.onTick?.(Math.floor((Date.now() - start) / 1000));
-
+    options.onTick();
     await setTimeout(options.interval, undefined, { signal });
   }
 }
