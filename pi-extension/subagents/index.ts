@@ -1019,6 +1019,8 @@ async function launchSubagent(
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
   envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
   envParts.push(`PI_SUBAGENT_CONVERSATION_PROFILE=${shellEscape(conversationProfile ? JSON.stringify(conversationProfile) : "")}`);
+  // Orca reports only the parent's completion; a child tab with no pane key posts no status.
+  if (process.env.ORCA_TERMINAL_HANDLE) envParts.push("ORCA_PANE_KEY=");
   const envPrefix = envParts.join(" ") + " ";
 
   // Pass task and skill prompts to the sub-agent.
