@@ -1,4 +1,34 @@
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { Type } from "@sinclair/typebox";
+import { Value } from "@sinclair/typebox/value";
 import { shellEscape } from "./mux.ts";
+
+const PiPackage = Type.Object({
+  name: Type.Literal("@earendil-works/pi-coding-agent"),
+  bin: Type.Object({ pi: Type.String({ minLength: 1 }) }),
+});
+
+/** Resolve the host CLI as executable and arguments; reject unidentified script hosts without searching PATH. */
+export function resolvePiCommand(): string[] {
+  const entry = process.argv[1];
+  const bun = "bun" in process.versions;
+  if (bun && entry && /^(?:\/\$bunfs\/|B:[\\/]~BUN[\\/])/.test(entry)) return [process.execPath];
+  // Bun does not implement node:sea; bundled Node JavaScript still uses the package's bin entry.
+  if (!bun && process.getBuiltinModule("node:sea").isSea()) return [process.execPath];
+  const unidentified = new Error("Cannot identify the parent Pi CLI. Start the parent through the installed Pi CLI.");
+  if (!entry) throw unidentified;
+  const script = realpathSync(entry);
+  for (let directory = dirname(script); ; directory = dirname(directory)) {
+    const manifest = join(directory, "package.json");
+    if (existsSync(manifest)) {
+      const pkg = JSON.parse(readFileSync(manifest, "utf8"));
+      if (!Value.Check(PiPackage, pkg) || realpathSync(join(directory, pkg.bin.pi)) !== script) throw unidentified;
+      return [process.execPath, script];
+    }
+    if (dirname(directory) === directory) throw unidentified;
+  }
+}
 
 /** Gate the existing foreground CLI on a first-writer claim and retain its actual shell status. */
 export function buildRunCommand(params: {

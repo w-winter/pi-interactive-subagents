@@ -1,6 +1,6 @@
 import { after, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -310,27 +310,52 @@ describe("Parent lifecycle ownership", () => {
   });
 
   for (const resumed of [false, true]) {
-    it(`retains stderr and exit status for a ${resumed ? "resumed" : "fresh"} Pi crash`, async (t) => {
+    it(`runs the parent's Pi and retains stderr for a ${resumed ? "resumed" : "fresh"} child`, async (t) => {
       process.env.ORCA_TEST_SCENARIO = "waiting";
       process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
       process.env.PI_CODING_AGENT_DIR = join(directory, "crash-config");
       const runtime = lifecycleRuntime();
       t.after(() => runtime.event("session_shutdown", "quit"));
+      const fatalRoot = mkdtempSync(join(tmpdir(), "pis-fatal-cli-"));
+      t.after(() => execFileSync("trash", [fatalRoot]));
+      const installation = join(fatalRoot, "parent's Pi installation");
+      mkdirSync(installation);
+      const failing = join(installation, "cli.mjs");
+      const execution = join(fatalRoot, "execution.json");
+      writeFileSync(join(installation, "package.json"), JSON.stringify({
+        name: "@earendil-works/pi-coding-agent", bin: { pi: "cli.mjs" },
+      }));
+      writeFileSync(failing, `import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(execution)}, JSON.stringify({ runtime: process.execPath, args: process.argv.slice(1) }));
+process.stdout.write("TUI output\\n");
+process.stderr.write("fatal handler error\\n");
+process.exitCode = 7;
+`);
+      const runtimePath = join(installation, "node runtime");
+      const expectedRuntime = realpathSync(process.execPath);
+      symlinkSync(process.execPath, runtimePath);
+      t.mock.property(process, "execPath", runtimePath);
+      process.argv[1] = failing;
+      const decoy = join(fatalRoot, "bin");
+      mkdirSync(decoy);
+      writeFileSync(join(decoy, "pi"), "#!/bin/sh\nprintf 'WRONG PI\\n'\nexit 99\n", { mode: 0o755 });
       const launched = await runtime.execute(resumed ? "subagent_resume" : "subagent", resumed
         ? { name: "Crash", sessionPath: runtime.sessionFile }
         : { name: "Crash", task: "Wait", cwd: runtime.root });
       const paths = Type.Object({ launchScriptFile: Type.String(), stderrFile: Type.String() });
       assert.ok(Value.Check(paths, launched.details), "launch must advertise a durable stderr path");
-      const fatalRoot = mkdtempSync(join(tmpdir(), "pis-fatal-cli-"));
-      t.after(() => execFileSync("trash", [fatalRoot]));
-      const failing = join(fatalRoot, "failing-cli");
-      writeFileSync(failing, "#!/bin/bash\nprintf 'TUI output\\n'\nprintf 'fatal handler error\\n' >&2\nexit 7\n", { mode: 0o755 });
-      const script = readFileSync(launched.details.launchScriptFile, "utf8").replace("/opt/homebrew/bin/pi", failing);
-      writeFileSync(launched.details.launchScriptFile, script);
+      const script = readFileSync(launched.details.launchScriptFile, "utf8");
+      assert.ok(script.includes(fatalRoot), "the generated command must select the parent installation before execution");
       const delivery = runtime.nextMessage();
       const output = execFileSync("bash", [launched.details.launchScriptFile], {
-        encoding: "utf8", env: { ...process.env, BASH_ENV: "" },
+        encoding: "utf8", cwd: runtime.root, env: { ...process.env, PATH: decoy + ":" + process.env.PATH, BASH_ENV: "" },
       });
+      const executed = Value.Decode(Type.Object({ runtime: Type.String(), args: Type.Array(Type.String()) }),
+        JSON.parse(readFileSync(execution, "utf8")));
+      assert.equal(executed.runtime, expectedRuntime);
+      assert.equal(executed.args[0], realpathSync(failing));
+      assert.equal(executed.args[1], "--session");
+      assert.doesNotMatch(output, /WRONG PI/);
       assert.match(output, /TUI output\n__SUBAGENT_DONE_7__/);
       assert.doesNotMatch(output, /fatal handler error/);
       assert.equal(readFileSync(launched.details.stderrFile, "utf8"), "fatal handler error\n");
@@ -340,7 +365,18 @@ describe("Parent lifecycle ownership", () => {
       assert.deepEqual(runtime.messageOptions.at(-1), { triggerTurn: true, deliverAs: "steer" });
       const artifacts = join(import.meta.dirname, "artifacts", "parent-lifecycle");
       mkdirSync(artifacts, { recursive: true });
-      writeFileSync(join(artifacts, `stderr-${resumed}.json`), JSON.stringify({ output, message, delivery: runtime.messageOptions.at(-1), stderr: readFileSync(launched.details.stderrFile, "utf8"), paidRequests: 0 }, null, 2));
+      writeFileSync(join(artifacts, `stderr-${resumed}.json`), JSON.stringify({ executed, output, message, delivery: runtime.messageOptions.at(-1), stderr: readFileSync(launched.details.stderrFile, "utf8"), paidRequests: 0 }, null, 2));
+    });
+
+    it(`rejects an unidentified parent before opening a ${resumed ? "resume" : "launch"} pane`, async (t) => {
+      const runtime = lifecycleRuntime();
+      t.after(() => runtime.event("session_shutdown", "quit"));
+      process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "0";
+      process.argv[1] = import.meta.filename;
+      await assert.rejects(runtime.execute(resumed ? "subagent_resume" : "subagent", resumed
+        ? { name: "Unknown host", sessionPath: runtime.sessionFile }
+        : { name: "Unknown host", task: "Wait", cwd: runtime.root }), /Cannot identify.*Pi CLI/);
+      assert.ok(!calls().some((call) => Array.isArray(call) && call[1] === "create"));
     });
   }
 });
@@ -393,7 +429,9 @@ describe("Launch and cleanup failure boundaries", () => {
   });
 });
 
-beforeEach(() => {
+beforeEach((t) => {
+  // This API double runs inside node:test, so identify the same CLI as the native fixtures explicitly.
+  t.mock.property(process, "argv", [process.execPath, "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"]);
   process.env.PI_SUBAGENT_MUX = "orca";
   process.env.ORCA_TERMINAL_HANDLE = "term_parent";
   process.env.ORCA_CLI_COMMAND = cli;

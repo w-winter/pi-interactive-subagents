@@ -77,7 +77,7 @@ async function fixture(claudeInteractive = false, extraEnv: Record<string, strin
     RECOVERY_LIFECYCLE_LOG: join(dir, "lifecycle.jsonl"), ...extraEnv,
   });
   const options = {
-    cliPath: "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js", cwd: dir,
+    cliPath: "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js", cwd: dir,
     args: ["--offline", "--no-extensions", "--no-skills", "--no-context-files", "--no-prompt-templates",
       "--session-dir", sessions, "--session", parentFile, "--model", "recovery-test/parent",
       "-e", provider, "-e", join(root, "pi-extension/subagents/index.ts")], env,

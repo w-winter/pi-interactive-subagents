@@ -53,6 +53,8 @@ zellij --session pi   # then run: pi
 
 Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm|orca` to force a specific backend.
 
+Pi-backed launches and resumes use the caller's Pi installation. For npm installations, the child runs with the parent's runtime executable and the CLI declared by that package. Standalone Bun builds and Node single-executable applications (SEA) relaunch their executable directly. Start the parent through the installed Pi CLI. Other file-backed entry points are rejected before a pane opens.
+
 [Orca](https://github.com/stablyai/orca) is an AI orchestrator with a built-in terminal multiplexer. It runs CLI coding agents in worktree-scoped terminal tabs and supports split terminal panes. When Pi runs in a local Orca worktree terminal, each subagent opens in a new background terminal tab in the same worktree without taking focus.
 
 Register Orca's bundled [`orca` CLI](https://www.onorca.dev/docs/cli/overview) under **Settings → General → Orca CLI**. Verify that `orca terminal read --help` lists `--screen`. To use another compatible Orca CLI executable, set `ORCA_CLI_COMMAND` to its command name or path.

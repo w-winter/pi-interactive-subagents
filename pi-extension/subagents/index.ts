@@ -23,7 +23,7 @@ import {
   type SubagentSessionMode,
 } from "./agent-definitions.ts";
 import { buildModelArgs, buildResumeArgs, conversationArgs, readConversationProfile, type ConversationProfile } from "./conversation-profile.ts";
-import { buildRunCommand } from "./launch-command.ts";
+import { buildRunCommand, resolvePiCommand } from "./launch-command.ts";
 import { ParentRunObserver } from "./recovery.ts";
 import { cancelUnstarted, decodeRun, type RunRecord, type RunOutcome } from "./run-records.ts";
 import { isTabClosed } from "./orca.ts";
@@ -834,6 +834,7 @@ async function launchSubagent(
     throw new Error("Conversation agents require an explicit model, a fresh Pi session, and no skills or tool overrides");
   }
   buildPiPromptArgs({ taskDelivery: launchBehavior.taskDelivery, taskArg: "", inputFiles: params.inputFiles });
+  const parts = agentDefs?.cli === "claude" ? [] : resolvePiCommand().map(shellEscape);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
@@ -954,8 +955,6 @@ async function launchSubagent(
 
   // ── Pi CLI path ──
 
-  // Build pi command
-  const parts: string[] = ["/opt/homebrew/bin/pi"];
   parts.push("--session", shellEscape(subagentSessionFile));
 
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
@@ -1562,13 +1561,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             throw new Error(`Conversation system prompt is missing: ${conversationProfile.systemPromptPath}`);
           }
 
+          const parts = [...resolvePiCommand().map(shellEscape), "--session", shellEscape(sessionPath)];
           surface = createSurface(name);
           await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
           observer.requireOpen();
-
-          // Build pi resume command
-          const parts = ["/opt/homebrew/bin/pi", "--session", shellEscape(sessionPath)];
 
           // Load subagent-done extension so the agent can self-terminate if needed
           const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
